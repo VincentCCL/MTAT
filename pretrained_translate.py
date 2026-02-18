@@ -23,6 +23,11 @@ def batch_iter(xs, bs):
 
 
 def compute_sacrebleu(sys_out, refs, metrics):
+    """
+    sys_out: list[str]
+    refs: list[str]
+    metrics: set[str] subset of {"bleu", "chrf"}
+    """
     try:
         import sacrebleu
     except ImportError as e:
@@ -31,16 +36,23 @@ def compute_sacrebleu(sys_out, refs, metrics):
             "  pip install sacrebleu"
         ) from e
 
+    # SacreBLEU expects list of reference streams (even for single-ref)
     ref_list = [refs]
+
     results = {}
 
     if "bleu" in metrics:
-        bleu = sacrebleu.corpus_bleu(sys_out, ref_list)
-        results["BLEU"] = {"score": bleu.score, "signature": bleu.signature}
+        bleu_metric = sacrebleu.metrics.BLEU()
+        bleu_score = bleu_metric.corpus_score(sys_out, ref_list)
+        # signature may be available via get_signature() depending on version
+        sig = bleu_metric.get_signature() if hasattr(bleu_metric, "get_signature") else None
+        results["BLEU"] = {"score": float(bleu_score.score), "signature": str(sig) if sig else ""}
 
     if "chrf" in metrics:
-        chrf = sacrebleu.corpus_chrf(sys_out, ref_list)
-        results["chrF"] = {"score": chrf.score, "signature": chrf.signature}
+        chrf_metric = sacrebleu.metrics.CHRF()
+        chrf_score = chrf_metric.corpus_score(sys_out, ref_list)
+        sig = chrf_metric.get_signature() if hasattr(chrf_metric, "get_signature") else None
+        results["chrF"] = {"score": float(chrf_score.score), "signature": str(sig) if sig else ""}
 
     return results
 
