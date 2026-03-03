@@ -171,7 +171,9 @@ def main():
 
     # Load tokenizer/model
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model, use_fast=True)
-    model = AutoModelForSeq2SeqLM.from_pretrained(args.pretrained_model)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+
+    model.config.forced_bos_token_id = tokenizer.lang_code_to_id[tgt_lang]
 
     # mBART language control
     # For mbart-large-50*, tokenizer has .src_lang and .lang_code_to_id
@@ -281,7 +283,6 @@ def main():
         report_to=[],  # no wandb by default (student-friendly)
         load_best_model_at_end=False,
         metric_for_best_model=None,
-        forced_bos_token_id=forced_bos_token_id,
     )
 
     trainer = Seq2SeqTrainer(
