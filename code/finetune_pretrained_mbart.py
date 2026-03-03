@@ -209,26 +209,25 @@ def main():
         def __len__(self):
             return len(self.src)
 
-        def __getitem__(self, idx: int) -> Dict[str, List[int]]:
-            s = self.src[idx]
-            t = self.tgt[idx]
+        def __getitem__(self, idx):
+            src = self.src_lines[idx]
+            tgt = self.tgt_lines[idx]
 
-            # Encode source. For mBART, src_lang determines the language code used internally.
             model_inputs = self.tokenizer(
-                s,
+                src,
                 max_length=self.max_src_len,
                 truncation=True,
+                padding=False,
             )
 
-            # Encode target (labels)
-            with self.tokenizer.as_target_tokenizer():
-                labels = self.tokenizer(
-                    t,
-                    max_length=self.max_tgt_len,
-                    truncation=True,
-                )
+            labels = self.tokenizer(
+                text_target=tgt,
+                max_length=self.max_tgt_len,
+                truncation=True,
+                padding=False,
+            )["input_ids"]
 
-            model_inputs["labels"] = labels["input_ids"]
+            model_inputs["labels"] = labels
             return model_inputs
 
     train_ds = LinePairDataset(train_src, train_tgt, tokenizer, args.max_src_len, args.max_tgt_len)
