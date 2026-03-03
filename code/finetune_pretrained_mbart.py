@@ -171,7 +171,7 @@ def main():
 
     # Load tokenizer/model
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model, use_fast=True)
-    model = AutoModelForSeq2SeqLM.from_pretrained(args.pretrained-model)
+    model = AutoModelForSeq2SeqLM.from_pretrained(args.pretrained_model)
 
     model.config.forced_bos_token_id = tokenizer.lang_code_to_id[tgt_lang]
 
