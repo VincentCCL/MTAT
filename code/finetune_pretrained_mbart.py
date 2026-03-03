@@ -290,7 +290,7 @@ def main():
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
-       data_collator=data_collator,
+        data_collator=data_collator,
         compute_metrics=compute_metrics if args.eval_metrics else None,
     )
 
