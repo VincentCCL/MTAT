@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import random
+import torch
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -38,6 +39,7 @@ from transformers import (
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
     set_seed,
+    TrainerCallback
 )
 
 # Optional: sacrebleu for BLEU/chrF
@@ -97,7 +99,77 @@ def parse_metrics_list(metrics_str: str) -> List[str]:
         parts.append(chunk.strip().lower())
     return [p for p in parts if p]
 
+class ShowValExamplesCallback(TrainerCallback):
+    def __init__(
+        self,
+        tokenizer,
+        src_lang: str,
+        tgt_lang: str,
+        val_src: list,
+        val_tgt: list,
+        n: int,
+        max_src_len: int,
+        num_beams: int,
+        max_gen_len: int,
+        seed: int = 42,
+    ):
+        self.tokenizer = tokenizer
+        self.src_lang = src_lang
+        self.tgt_lang = tgt_lang
+        self.val_src = val_src
+        self.val_tgt = val_tgt
+        self.n = n
+        self.max_src_len = max_src_len
+        self.num_beams = num_beams
+        self.max_gen_len = max_gen_len
+        self.rng = random.Random(seed)
 
+    def on_epoch_end(self, args, state, control, **kwargs):
+        if self.n <= 0:
+            return
+
+        model = kwargs["model"]
+        model.eval()
+        device = model.device
+
+        # sample indices
+        n = min(self.n, len(self.val_src))
+        idxs = list(range(len(self.val_src)))
+        self.rng.shuffle(idxs)
+        idxs = idxs[:n]
+
+        # mBART: source language token in input; forced BOS to target language
+        forced_bos_token_id = self.tokenizer.lang_code_to_id[self.tgt_lang]#forced_bos_token_id = self.tokenizer.convert_tokens_to_ids(self.tgt_lang)
+
+        print(f"\n=== Validation examples @ epoch {state.epoch:.2f} ===")
+        for i in idxs:
+            src = self.val_src[i]
+            ref = self.val_tgt[i]
+
+            # Prepend source language tag if not already present
+            if not src.strip().startswith(f"<{self.src_lang}>"):
+                src_in = f"<{self.src_lang}> {src}"
+            else:
+                src_in = src
+
+            enc = self.tokenizer(
+                src_in,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_src_len,
+            ).to(device)
+
+            with torch.no_grad():
+                gen = model.generate(
+                    **enc,
+                    num_beams=self.num_beams,
+                    max_new_tokens=self.max_gen_len,
+                    forced_bos_token_id=forced_bos_token_id,
+                )
+
+            hyp = self.tokenizer.batch_decode(gen, skip_special_tokens=True)[0]
+            print(f"\nSRC: {src}\nREF: {ref}\nHYP: {hyp}")
+            
 def main():
     ap = argparse.ArgumentParser()
 
@@ -277,7 +349,7 @@ def main():
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         eval_steps=args.eval_steps,
-        eval_strategy="steps",
+        eval_strategy="epoch",
         save_strategy="no",
         predict_with_generate=True,
         generation_num_beams=args.num_beams,
@@ -297,7 +369,23 @@ def main():
         data_collator=data_collator,
         compute_metrics=compute_metrics if args.eval_metrics else None,
     )
-
+    # Show a few validation examples (generated)
+    if args.show_val_examples and args.show_val_examples > 0:
+        trainer.add_callback(
+            ShowValExamplesCallback(
+                tokenizer=tokenizer,
+                src_lang=args.src_lang,
+                tgt_lang=args.tgt_lang,
+                val_src=val_src,
+                val_tgt=val_tgt,
+                n=args.show_val_examples,
+                max_src_len=args.max_src_len,
+                num_beams=args.num_beams,
+                max_gen_len=args.max_gen_len,
+                seed=args.seed if hasattr(args, "seed") else 42,
+            )
+        )
+    
     # Train
     print("Model device:", next(model.parameters()).device)
     trainer.train()
@@ -321,34 +409,8 @@ def main():
             json.dump(trainer.state.log_history, f, indent=2, ensure_ascii=False)
         print(f"\nWrote training history to {args.history_json}")
 
-    # Show a few validation examples (generated)
-    if args.show_val_examples and args.show_val_examples > 0:
-        n = min(args.show_val_examples, len(val_src))
-        print(f"\nValidation examples (n={n}):")
-        # Sample first n (deterministic)
-        for i in range(n):
-            src_sent = val_src[i]
-            ref_sent = val_tgt[i]
-            enc = tokenizer(
-                src_sent,
-                return_tensors="pt",
-                truncation=True,
-                max_length=args.max_src_len,
-            )
-            enc = {k: v.to(model.device) for k, v in enc.items()}
-            gen = model.generate(
-                **enc,
-                num_beams=args.num_beams,
-                max_length=args.max_gen_len,
-                forced_bos_token_id=forced_bos_token_id,
-            )
-            hyp = tokenizer.decode(gen[0], skip_special_tokens=True).strip()
-            print("-" * 60)
-            print("SRC:", src_sent)
-            print("HYP:", hyp)
-            print("REF:", ref_sent)
+    
 
-    print("\nDone.")
 
 
 if __name__ == "__main__":
