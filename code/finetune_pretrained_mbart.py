@@ -84,7 +84,7 @@ def compute_sacrebleu_metrics(
         out["bleu"] = float(sacrebleu.corpus_bleu(preds, ref_lists, force=True).score)
     if "chrf" in requested or "chrf++" in requested:
         # Use chrF2 (default) or CHRF++? sacrebleu uses chrF by default.
-        out["chrf"] = float(sacrebleu.corpus_chrf(preds, ref_lists, force=True).score)
+        out["chrf"] = float(sacrebleu.corpus_chrf(preds, ref_lists).score)
     return out
 
 
