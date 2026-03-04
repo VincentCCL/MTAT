@@ -181,7 +181,7 @@ def main():
         tokenizer.src_lang = args.src_lang
     else:
         raise ValueError("Tokenizer does not support src_lang; are you using an mBART model?")
-
+    tokenizer.tgt_lang = args.tgt_lang
     if not hasattr(tokenizer, "lang_code_to_id"):
         raise ValueError("Tokenizer does not provide lang_code_to_id; are you using mbart-large-50?")
 
@@ -210,8 +210,8 @@ def main():
             return len(self.src)
 
         def __getitem__(self, idx):
-            src = self.src_lines[idx]
-            tgt = self.tgt_lines[idx]
+            src = self.src[idx]
+            tgt = self.tgt[idx]
 
             model_inputs = self.tokenizer(
                 src,
@@ -294,6 +294,7 @@ def main():
     )
 
     # Train
+    print("Model device:", next(model.parameters()).device)
     trainer.train()
 
     # Final eval
