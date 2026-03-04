@@ -287,7 +287,6 @@ def main():
         load_best_model_at_end=False,
         metric_for_best_model=None,
         save_only_model=True, 
-        save_total_limit=1
     )
 
     trainer = Seq2SeqTrainer(
