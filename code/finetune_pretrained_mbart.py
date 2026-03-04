@@ -139,7 +139,7 @@ class ShowValExamplesCallback(TrainerCallback):
         idxs = idxs[:n]
 
         # mBART: source language token in input; forced BOS to target language
-        forced_bos_token_id = self.tokenizer.lang_code_to_id[self.tgt_lang]#forced_bos_token_id = self.tokenizer.convert_tokens_to_ids(self.tgt_lang)
+        forced_bos_token_id = self.tokenizer.lang_code_to_id[self.tgt_lang]
 
         print(f"\n=== Validation examples @ epoch {state.epoch:.2f} ===")
         for i in idxs:
