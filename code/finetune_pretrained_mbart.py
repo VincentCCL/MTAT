@@ -122,7 +122,12 @@ class ShowValExamplesCallback(TrainerCallback):
         self.max_src_len = max_src_len
         self.num_beams = num_beams
         self.max_gen_len = max_gen_len
-        self.rng = random.Random(seed)
+        # Pick fixed indices ONCE (deterministic)
+        rng = random.Random(seed)
+        idxs = list(range(len(val_src)))
+        rng.shuffle(idxs)
+        self.fixed_idxs = idxs[: min(n, len(val_src))]
+                               
 
     def on_epoch_end(self, args, state, control, **kwargs):
         if self.n <= 0:
@@ -132,17 +137,11 @@ class ShowValExamplesCallback(TrainerCallback):
         model.eval()
         device = model.device
 
-        # sample indices
-        n = min(self.n, len(self.val_src))
-        idxs = list(range(len(self.val_src)))
-        self.rng.shuffle(idxs)
-        idxs = idxs[:n]
-
         # mBART: source language token in input; forced BOS to target language
         forced_bos_token_id = self.tokenizer.lang_code_to_id[self.tgt_lang]
 
         print(f"\n=== Validation examples @ epoch {state.epoch:.2f} ===")
-        for i in idxs:
+        for i in self.fixed_idxs:
             src = self.val_src[i]
             ref = self.val_tgt[i]
 
