@@ -278,7 +278,7 @@ def main():
         save_steps=args.save_steps,
         eval_steps=args.eval_steps,
         eval_strategy="steps",
-        save_strategy="steps",
+        save_strategy="no",
         predict_with_generate=True,
         generation_num_beams=args.num_beams,
         generation_max_length=args.max_gen_len,
@@ -286,6 +286,8 @@ def main():
         report_to=[],  # no wandb by default (student-friendly)
         load_best_model_at_end=False,
         metric_for_best_model=None,
+        save_only_model=True, 
+        save_total_limit=1
     )
 
     trainer = Seq2SeqTrainer(
