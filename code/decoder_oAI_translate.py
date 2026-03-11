@@ -180,6 +180,19 @@ def write_lines(path: str, lines: List[str]) -> None:
         for line in lines:
             f.write(line + "\n")
 
+def show_batch(batch_no, batch, translations, progress=False, show_n=1):
+    n = min(show_n, len(batch), len(translations))
+    lines = [f"--- Batch {batch_no} ---"]
+    for src, tgt in zip(batch[:n], translations[:n]):
+        lines.append(f"SRC: {src}")
+        lines.append(f"TGT: {tgt}")
+        lines.append("")
+    msg = "\n".join(lines)
+
+    if progress and tqdm is not None:
+        tqdm.write(msg)
+    else:
+        print(msg, flush=True)
 
 def translate_file(args):
     api_key = get_api_key(args.api_key, args.api_env, args.kaggle_secret)
@@ -240,19 +253,14 @@ def translate_file(args):
 
         done += len(batch)
 
-        if args.print_batches:
-            lines_to_show = [f"--- Batch {batch_no} ---"]
-            for src, tgt in zip(batch, translations):
-                lines_to_show.append(f"SRC: {src}")
-                lines_to_show.append(f"TGT: {tgt}")
-                lines_to_show.append("")
-            msg = "\n".join(lines_to_show)
-
-            if args.progress and tqdm is not None:
-                tqdm.write(msg)
-            else:
-                print(msg, flush=True)
-                
+        if args.show_translations:
+            show_batch(
+                batch_no=batch_no,
+                batch=batch,
+                translations=translations,
+                progress=args.progress,
+                show_n=args.show_n,
+            )       
         if args.print_every > 0 and batch_no % args.print_every == 0:
             msg = f"[info] translated {done}/{total_sentences} non-empty lines"
             if args.progress and tqdm is not None:
@@ -293,6 +301,10 @@ def build_argparser():
     ap.add_argument("--print-every", type=int, default=0, help="Print progress every N batches")
     ap.add_argument("--save-every", type=int, default=0, help="Save partial output every N batches")
     ap.add_argument("--debug", action="store_true", help="Print debug messages")
+    ap.add_argument("--show-translations", action="store_true",
+                help="Show source and translation pairs while translating")
+    ap.add_argument("--show-n", type=int, default=1,
+                help="How many sentence pairs to show per batch when --show-translations is used")
 
     key_group = ap.add_mutually_exclusive_group(required=True)
     key_group.add_argument("--api-key", help="Pass API key directly")
