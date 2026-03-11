@@ -1,4 +1,3 @@
-%%writefile blablador_translate.py
 #!/usr/bin/env python3
 
 import argparse
