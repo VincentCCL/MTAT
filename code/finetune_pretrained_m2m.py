@@ -243,7 +243,7 @@ def main():
         warmup_steps=args.warmup_steps,
         fp16=args.fp16,
         logging_steps=args.logging_steps,
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         eval_steps=args.eval_steps,
         save_strategy="steps",
         save_steps=args.save_steps,
