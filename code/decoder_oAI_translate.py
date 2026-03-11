@@ -241,19 +241,25 @@ def translate_file(args):
         done += len(batch)
 
         if args.print_batches:
-            print(f"\n--- Batch {batch_no} ---", flush=True)
+            lines_to_show = [f"--- Batch {batch_no} ---"]
             for src, tgt in zip(batch, translations):
-                print(f"SRC: {src}", flush=True)
-                print(f"TGT: {tgt}", flush=True)
-                print("", flush=True)
+                lines_to_show.append(f"SRC: {src}")
+                lines_to_show.append(f"TGT: {tgt}")
+                lines_to_show.append("")
+            msg = "\n".join(lines_to_show)
 
+            if args.progress and tqdm is not None:
+                tqdm.write(msg)
+            else:
+                print(msg, flush=True)
+                
         if args.print_every > 0 and batch_no % args.print_every == 0:
-            print(
-                f"[info] translated {done}/{total_sentences} non-empty lines",
-                file=sys.stderr,
-                flush=True,
-            )
-
+            msg = f"[info] translated {done}/{total_sentences} non-empty lines"
+            if args.progress and tqdm is not None:
+                tqdm.write(msg)
+            else:
+                print(msg, flush=True)
+            
         if args.save_every > 0 and batch_no % args.save_every == 0:
             write_lines(args.output, output_lines)
             print(
