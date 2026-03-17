@@ -210,8 +210,8 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
     model = AutoModelForSeq2SeqLM.from_pretrained(args.pretrained_model)
 
-    # IMPORTANT for M2M: set tokenizer src_lang; target is handled in generation via forced_bos_token_id
     tokenizer.src_lang = args.src_lang
+    tokenizer.tgt_lang = args.tgt_lang
     forced_bos_token_id = tokenizer.get_lang_id(args.tgt_lang)
 
     # Datasets
