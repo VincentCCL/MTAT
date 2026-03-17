@@ -194,6 +194,14 @@ def main():
     ap.add_argument("--eval-steps", type=int, default=500)
     ap.add_argument("--save-steps", type=int, default=500)
 
+    ap.add_argument("--eval-batch-size", type=int, default=1)
+    ap.add_argument("--no-generate", action="store_true",
+                    help="Disable generation during eval to save VRAM.")
+    ap.add_argument("--gradient-checkpointing", action="store_true")
+    ap.add_argument("--eval-max-gen-len", type=int, default=64)
+    ap.add_argument("--eval-num-beams", type=int, default=1)
+    ap.add_argument("--eval-disabled", action="store_true",
+                    help="Disable validation during training.")
     args = ap.parse_args()
     set_seed(args.seed)
 
@@ -209,10 +217,15 @@ def main():
     # Load
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
     model = AutoModelForSeq2SeqLM.from_pretrained(args.pretrained_model)
+    model.config.tie_word_embeddings = False
 
     tokenizer.src_lang = args.src_lang
     tokenizer.tgt_lang = args.tgt_lang
     forced_bos_token_id = tokenizer.get_lang_id(args.tgt_lang)
+
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        model.config.use_cache = False
 
     # Datasets
     train_ds = ParallelDataset(train_src, train_tgt, tokenizer, args.max_src_len, args.max_tgt_len)
@@ -234,22 +247,23 @@ def main():
         num_train_epochs=args.epochs,
         learning_rate=args.lr,
         per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.eval_batch_size,
         gradient_accumulation_steps=args.grad_accum,
         weight_decay=args.weight_decay,
         warmup_steps=args.warmup_steps,
         fp16=args.fp16,
+        gradient_checkpointing=args.gradient_checkpointing,
         logging_steps=args.logging_steps,
-        eval_strategy="steps",
+        eval_strategy="no" if args.eval_disabled else "steps",
         eval_steps=args.eval_steps,
         save_strategy="steps",
         save_steps=args.save_steps,
         save_total_limit=2,
-        predict_with_generate=True,
-        generation_num_beams=args.num_beams,
-        generation_max_length=args.max_gen_len,
+        predict_with_generate=not args.no_generate,
+        generation_num_beams=args.eval_num_beams,
+        generation_max_length=args.eval_max_gen_len,
         report_to="none",
-    )
+)
 
     # Make sure trainer uses correct target language at generation time
     model.config.forced_bos_token_id = forced_bos_token_id
@@ -259,7 +273,6 @@ def main():
         args=train_args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
-        #tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
     )
