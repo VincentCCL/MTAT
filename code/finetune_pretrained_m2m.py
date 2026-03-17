@@ -69,14 +69,11 @@ class ParallelDataset(torch.utils.data.Dataset):
             truncation=True,
         )
 
-        # Tokenize labels (target). For M2M we control target language at generation time
-        # via forced_bos_token_id, so labels do not need a language token.
-        with self.tokenizer.as_target_tokenizer():
-            labels = self.tokenizer(
-                tgt_text,
-                max_length=self.max_tgt_len,
-                truncation=True,
-            )
+        labels = self.tokenizer(
+           text_target=tgt_text,
+            max_length=self.max_tgt_len,
+            truncation=True,
+        )
 
         model_inputs["labels"] = labels["input_ids"]
         return model_inputs
