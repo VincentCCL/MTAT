@@ -103,12 +103,12 @@ def main():
                 early_stopping=True,
             )
 
-        batch_hyps = tokenizer.batch_decode(out, skip_special_tokens=True)
+        decoded = tokenizer.batch_decode(out, skip_special_tokens=True)
         for i in range(min(3, len(decoded))):
             print(f"\n[SRC] {src_batch[i]}")
             print(f"[OUT] {decoded[i]}")
             print("-" * 40)
-        hyps.extend(batch_hyps)
+        hyps.extend(decoded)
 
     write_lines(args.out_file, hyps)
     print(f"Wrote {len(hyps)} translations to {args.out_file}")
