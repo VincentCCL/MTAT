@@ -104,9 +104,11 @@ def main():
             )
 
         decoded = tokenizer.batch_decode(out, skip_special_tokens=True)
-        for i in range(min(3, len(decoded))):
-            print(f"\n[SRC] {src_batch[i]}")
-            print(f"[OUT] {decoded[i]}")
+        for i, (src, out_text) in enumerate(zip(batch, decoded)):
+            if i >= 3:
+                break
+            print("\n[SRC]", src)
+            print("[OUT]", out_text)
             print("-" * 40)
         hyps.extend(decoded)
 
