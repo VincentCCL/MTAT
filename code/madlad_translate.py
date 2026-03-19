@@ -108,7 +108,7 @@ def main():
         print("[SRC]", batch[0])
         print("[OUT]", batch_hyps[0])
         print("-" * 50)
-        hyps.extend(decoded)
+        hyps.extend(batch_hyps)
 
     write_lines(args.out_file, hyps)
     print(f"Wrote {len(hyps)} translations to {args.out_file}")
