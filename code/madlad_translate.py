@@ -15,6 +15,8 @@ python translate_madlad400.py \
 import argparse
 from typing import List
 
+from tqdm import tqdm
+
 import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
@@ -78,7 +80,9 @@ def main():
 
     hyps: List[str] = []
 
-    for batch in batched(src_lines, args.batch_size):
+    total_batches = (len(src_lines) + args.batch_size - 1) // args.batch_size
+
+    for batch in tqdm(batched(src_lines, args.batch_size), total=total_batches, desc="Translating"):
         batch_inputs = make_madlad_inputs(batch, args.tgt_lang)
 
         enc = tokenizer(
