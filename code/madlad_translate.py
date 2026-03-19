@@ -98,9 +98,16 @@ def main():
                 **enc,
                 num_beams=args.num_beams,
                 max_new_tokens=args.max_gen_len,
-            )
+                no_repeat_ngram_size=3,
+               repetition_penalty=1.1,
+                early_stopping=True,
+            ))
 
         batch_hyps = tokenizer.batch_decode(out, skip_special_tokens=True)
+        for i in range(min(3, len(decoded))):
+            print(f"\n[SRC] {src_batch[i]}")
+            print(f"[OUT] {decoded[i]}")
+            print("-" * 40)
         hyps.extend(batch_hyps)
 
     write_lines(args.out_file, hyps)
