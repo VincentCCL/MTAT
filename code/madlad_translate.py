@@ -18,7 +18,7 @@ from typing import List
 from tqdm import tqdm
 
 import torch
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from transformers import T5Tokenizer, T5ForConditionalGeneration
 
 try:
     import sacrebleu
@@ -71,8 +71,8 @@ def main():
 
     src_lines = read_lines(args.src_file)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
-    model = AutoModelForSeq2SeqLM.from_pretrained(args.model_dir)
+    tokenizer = T5Tokenizer.from_pretrained(args.model_dir)
+    model = T5ForConditionalGeneration.from_pretrained(args.model_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -99,17 +99,15 @@ def main():
                 num_beams=args.num_beams,
                 max_new_tokens=args.max_gen_len,
                 no_repeat_ngram_size=3,
-               repetition_penalty=1.1,
+                repetition_penalty=1.1,
                 early_stopping=True,
             )
 
-        decoded = tokenizer.batch_decode(out, skip_special_tokens=True)
-        for i, (src, out_text) in enumerate(zip(batch, decoded)):
-            if i >= 3:
-                break
-            print("\n[SRC]", src)
-            print("[OUT]", out_text)
-            print("-" * 40)
+        batch_hyps = tokenizer.batch_decode(out, skip_special_tokens=True)
+        print("\n[IN ]", batch_inputs[0])
+        print("[SRC]", batch[0])
+        print("[OUT]", batch_hyps[0])
+        print("-" * 50)
         hyps.extend(decoded)
 
     write_lines(args.out_file, hyps)
