@@ -101,7 +101,7 @@ def main():
                 no_repeat_ngram_size=3,
                repetition_penalty=1.1,
                 early_stopping=True,
-            ))
+            )
 
         batch_hyps = tokenizer.batch_decode(out, skip_special_tokens=True)
         for i in range(min(3, len(decoded))):
