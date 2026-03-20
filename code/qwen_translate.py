@@ -137,8 +137,32 @@ def maybe_apply_chat_template(tokenizer, user_prompt: str, system_prompt: str, u
 
 
 def clean_output(text: str) -> str:
-    return text.strip().replace("\n", " ").strip()
+    text = text.strip()
 
+    # Remove common chat prefixes
+    prefixes = [
+        "assistant:",
+        "assistant",
+        "Assistant:",
+        "Assistant",
+    ]
+
+    for p in prefixes:
+        if text.startswith(p):
+            text = text[len(p):].strip()
+
+    # Remove prompt echoes (very important)
+    if "Translate" in text or "translation" in text:
+        # keep only last sentence-like segment
+        parts = text.split("\n")
+        text = parts[-1]
+
+    # Remove duplicated source (common issue)
+    # e.g. "Tom thought Mary... assistant Tom dacht..."
+    if "assistant" in text:
+        text = text.split("assistant")[-1].strip()
+
+    return " ".join(text.split())
 
 def main():
     args = parse_args()
