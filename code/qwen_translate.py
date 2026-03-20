@@ -162,18 +162,26 @@ def maybe_apply_chat_template(tokenizer, user_prompt: str, system_prompt: str, u
 def clean_output(text: str) -> str:
     text = text.strip()
 
+    # Keep only first line
+    text = text.splitlines()[0].strip()
+
+    # Remove common role/prompt prefixes
     prefixes = [
         "assistant:",
         "assistant",
         "Assistant:",
         "Assistant",
+        "Dutch:",
+        "Translation:",
+        "translation:",
     ]
-    for prefix in prefixes:
-        if text.startswith(prefix):
-            text = text[len(prefix):].strip()
-
-    if "assistant" in text:
-        text = text.split("assistant")[-1].strip()
+    changed = True
+    while changed:
+        changed = False
+        for p in prefixes:
+            if text.startswith(p):
+                text = text[len(p):].strip()
+                changed = True
 
     return " ".join(text.split())
 
@@ -293,7 +301,7 @@ def main():
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=args.max_input-length if hasattr(args, "max_input-length") else args.max_input_length
+            max_length=args.max_input_length
         )
         enc = {k: v.to(device) for k, v in enc.items()}
 
