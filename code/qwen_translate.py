@@ -166,7 +166,7 @@ def main():
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-
+    tokenizer.padding_side = "left"
     if args.debug:
         print(f"[DEBUG] Loading model: {args.model}")
     model = AutoModelForCausalLM.from_pretrained(
@@ -228,12 +228,11 @@ def main():
         if args.num_beams > 1:
             gen_kwargs["num_beams"] = args.num_beams
             gen_kwargs["do_sample"] = False
+        elif args.temperature > 0:
+            gen_kwargs["do_sample"] = True
+            gen_kwargs["temperature"] = args.temperature
+            gen_kwargs["top_p"] = args.top_p
         else:
-            if args.temperature > 0:
-                gen_kwargs["do_sample"] = True
-                gen_kwargs["temperature"] = args.temperature
-                gen_kwargs["top_p"] = args.top_p
-            else:
                 gen_kwargs["do_sample"] = False
 
         with torch.no_grad():
