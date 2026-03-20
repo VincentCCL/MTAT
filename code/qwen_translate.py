@@ -2,19 +2,13 @@
 # qwen_translate.py
 
 import argparse
-import json
 import math
-from pathlib import Path
+import os
 from typing import List
 
 import torch
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
-try:
-    import sacrebleu
-except ImportError:
-    sacrebleu = None
 
 
 def parse_args():
@@ -33,7 +27,7 @@ def parse_args():
     )
 
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size for generation.")
-    parser.add_argument("--max-new-tokens", type=int, default=80, help="Maximum new tokens to generate.")
+    parser.add_argument("--max-new-tokens", type=int, default=128, help="Maximum new tokens to generate.")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature.")
     parser.add_argument("--top-p", type=float, default=1.0, help="Top-p for sampling.")
     parser.add_argument("--num-beams", type=int, default=1, help="Beam size for generation.")
@@ -50,7 +44,7 @@ def parse_args():
         "--print-every",
         type=int,
         default=0,
-        help="Print progress every N translated lines (0 = never)."
+        help="Print progress every N lines translated (0 = never)."
     )
     parser.add_argument(
         "--save-every",
@@ -58,7 +52,7 @@ def parse_args():
         default=0,
         help="Save intermediate output every N lines (0 = only save at end)."
     )
-    parser.add_argument("--debug", action="store_true", help="Verbose debug output.")
+    parser.add_argument("--debug", action="store_true", help="Verbose debugging output.")
     parser.add_argument(
         "--show-translations",
         action="store_true",
@@ -73,7 +67,8 @@ def parse_args():
 
     parser.add_argument(
         "--prompt-template",
-        default="{text}\n\nTranslate to {target_lang}:",
+        default="Translate the following text from {source_lang} to {target_lang}. "
+                "Only output the translation.\n\n{text}",
         help=(
             "Custom prompt template. Available placeholders: "
             "{source_lang}, {target_lang}, {text}"
@@ -81,8 +76,8 @@ def parse_args():
     )
     parser.add_argument(
         "--system-prompt",
-        default="",
-        help="Optional system prompt used only when --use-chat-template is enabled."
+        default="You are a careful machine translation system.",
+        help="Optional system prompt used when --use-chat-template is enabled."
     )
     parser.add_argument(
         "--use-chat-template",
@@ -94,24 +89,6 @@ def parse_args():
         "--trust-remote-code",
         action="store_true",
         help="Pass trust_remote_code=True to tokenizer/model."
-    )
-
-    parser.add_argument(
-        "--ref",
-        default=None,
-        help="Optional reference translation file for evaluation."
-    )
-    parser.add_argument(
-        "--metrics",
-        nargs="+",
-        default=["bleu", "chrf", "ter"],
-        choices=["bleu", "chrf", "ter"],
-        help="SacreBLEU metrics to compute when --ref is provided."
-    )
-    parser.add_argument(
-        "--metrics-json",
-        default=None,
-        help="Optional path to save metric results as JSON."
     )
 
     return parser.parse_args()
@@ -162,55 +139,30 @@ def maybe_apply_chat_template(tokenizer, user_prompt: str, system_prompt: str, u
 def clean_output(text: str) -> str:
     text = text.strip()
 
-    # Keep only first line
-    text = text.splitlines()[0].strip()
-
-    # Remove common role/prompt prefixes
+    # Remove common chat prefixes
     prefixes = [
         "assistant:",
         "assistant",
         "Assistant:",
         "Assistant",
-        "Dutch:",
-        "Translation:",
-        "translation:",
     ]
-    changed = True
-    while changed:
-        changed = False
-        for p in prefixes:
-            if text.startswith(p):
-                text = text[len(p):].strip()
-                changed = True
+
+    for p in prefixes:
+        if text.startswith(p):
+            text = text[len(p):].strip()
+
+    # Remove prompt echoes (very important)
+    if "Translate" in text or "translation" in text:
+        # keep only last sentence-like segment
+        parts = text.split("\n")
+        text = parts[-1]
+
+    # Remove duplicated source (common issue)
+    # e.g. "Tom thought Mary... assistant Tom dacht..."
+    if "assistant" in text:
+        text = text.split("assistant")[-1].strip()
 
     return " ".join(text.split())
-
-
-def compute_metrics(preds: List[str], refs: List[str], requested: List[str]):
-    if sacrebleu is None:
-        raise ImportError(
-            "sacrebleu is not installed. Install it with: pip install sacrebleu"
-        )
-
-    if len(preds) != len(refs):
-        raise ValueError(
-            f"Prediction/reference length mismatch: {len(preds)} preds vs {len(refs)} refs"
-        )
-
-    ref_lists = [refs]
-    out = {}
-
-    if "bleu" in requested:
-        out["bleu"] = float(sacrebleu.corpus_bleu(preds, ref_lists).score)
-
-    if "chrf" in requested:
-        out["chrf"] = float(sacrebleu.corpus_chrf(preds, ref_lists).score)
-
-    if "ter" in requested:
-        out["ter"] = float(sacrebleu.corpus_ter(preds, ref_lists).score)
-
-    return out
-
 
 def main():
     args = parse_args()
@@ -225,19 +177,9 @@ def main():
     if args.debug:
         print(f"[DEBUG] Loaded {len(src_lines)} lines from {args.input}")
 
-    ref_lines = None
-    if args.ref is not None:
-        ref_lines = read_lines(args.ref)
-        if len(ref_lines) != len(src_lines):
-            raise ValueError(
-                f"Input and ref must have the same number of lines, got "
-                f"{len(src_lines)} input vs {len(ref_lines)} ref"
-            )
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] Using device: {device}")
-    if device.type == "cuda":
-        print(f"[INFO] GPU: {torch.cuda.get_device_name(0)}")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.debug:
+        print(f"[DEBUG] Using device: {device}")
 
     if args.debug:
         print(f"[DEBUG] Loading tokenizer: {args.model}")
@@ -249,19 +191,13 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
-
     if args.debug:
         print(f"[DEBUG] Loading model: {args.model}")
-
-    model_kwargs = {"trust_remote_code": args.trust_remote_code}
-    try:
-        model_kwargs["dtype"] = torch.float16 if device.type == "cuda" else torch.float32
-        model = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
-    except TypeError:
-        model_kwargs.pop("dtype", None)
-        model_kwargs["torch_dtype"] = torch.float16 if device.type == "cuda" else torch.float32
-        model = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
-
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        trust_remote_code=args.trust_remote_code
+    )
     model.to(device)
     model.eval()
 
@@ -305,15 +241,13 @@ def main():
         )
         enc = {k: v.to(device) for k, v in enc.items()}
 
-        input_lengths = enc["attention_mask"].sum(dim=1).tolist()
+        prompt_lengths = enc["attention_mask"].sum(dim=1).tolist()
 
         gen_kwargs = {
             "max_new_tokens": args.max_new_tokens,
             "pad_token_id": tokenizer.pad_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
         }
-
-        if tokenizer.eos_token_id is not None:
-            gen_kwargs["eos_token_id"] = tokenizer.eos_token_id
 
         if args.num_beams > 1:
             gen_kwargs["num_beams"] = args.num_beams
@@ -323,14 +257,14 @@ def main():
             gen_kwargs["temperature"] = args.temperature
             gen_kwargs["top_p"] = args.top_p
         else:
-            gen_kwargs["do_sample"] = False
+                gen_kwargs["do_sample"] = False
 
         with torch.no_grad():
             generated = model.generate(**enc, **gen_kwargs)
 
         batch_out = []
         for i in range(len(batch)):
-            gen_tokens = generated[i][input_lengths[i]:]
+            gen_tokens = generated[i][prompt_lengths[i]:]
             text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
             text = clean_output(text)
             batch_out.append(text)
@@ -350,9 +284,6 @@ def main():
             for j in range(n_show):
                 print(f"SRC: {batch[j]}")
                 print(f"HYP: {batch_out[j]}")
-                if ref_lines is not None:
-                    ref_idx = total_done - len(batch) + j
-                    print(f"REF: {ref_lines[ref_idx]}")
                 print()
 
         if args.save_every and total_done % args.save_every == 0:
@@ -362,18 +293,6 @@ def main():
 
     write_lines(args.output, outputs)
     print(f"[DONE] Wrote {len(outputs)} translations to {args.output}")
-
-    if ref_lines is not None:
-        scores = compute_metrics(outputs, ref_lines, args.metrics)
-
-        print("\n=== SacreBLEU evaluation ===")
-        for metric_name, value in scores.items():
-            print(f"{metric_name.upper()}: {value:.4f}")
-
-        if args.metrics_json is not None:
-            with open(args.metrics_json, "w", encoding="utf-8") as f:
-                json.dump(scores, f, indent=2, ensure_ascii=False)
-            print(f"[DONE] Wrote metrics JSON to {args.metrics_json}")
 
 
 if __name__ == "__main__":
