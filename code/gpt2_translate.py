@@ -85,6 +85,7 @@ def main():
 
     print(f"[INFO] Loading model: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer.padding_side = "left"
     model = AutoModelForCausalLM.from_pretrained(args.model)
 
     if tokenizer.pad_token is None:
