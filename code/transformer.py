@@ -80,10 +80,13 @@ class ShowValidationExamplesCallback(TrainerCallback):
         self.num_beams = num_beams
         self.device = device
         
-        # NEW: choose a fixed random subset ONCE (reused every epoch)
+        # choose the first k validation examples, like rnn_seq2seq.py
         k = min(self.num_examples, len(self.val_src_lines))
-        rng = random.Random(seed)
-        self.idxs = rng.sample(range(len(self.val_src_lines)), k)
+        self.idxs = list(range(k))
+        # NEW: choose a fixed random subset ONCE (reused every epoch)
+        #k = min(self.num_examples, len(self.val_src_lines))
+        #rng = random.Random(seed)
+        #self.idxs = rng.sample(range(len(self.val_src_lines)), k)
 
     def on_evaluate(self, args, state, control, **kwargs):
         if self.num_examples <= 0:
