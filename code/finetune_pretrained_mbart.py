@@ -122,11 +122,13 @@ class ShowValExamplesCallback(TrainerCallback):
         self.max_src_len = max_src_len
         self.num_beams = num_beams
         self.max_gen_len = max_gen_len
+        
+        self.fixed_idxs = list(range(min(n, len(val_src))))
         # Pick fixed indices ONCE (deterministic)
-        rng = random.Random(seed)
-        idxs = list(range(len(val_src)))
-        rng.shuffle(idxs)
-        self.fixed_idxs = idxs[: min(n, len(val_src))]
+        #rng = random.Random(seed)
+        #idxs = list(range(len(val_src)))
+        #rng.shuffle(idxs)
+        #self.fixed_idxs = idxs[: min(n, len(val_src))]
                                
 
     def on_epoch_end(self, args, state, control, **kwargs):
