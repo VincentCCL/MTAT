@@ -209,8 +209,10 @@ class ShowValidationExamplesCallback(TrainerCallback):
         self.device = device
 
         k = min(self.num_examples, len(self.val_src_lines))
-        rng = random.Random(seed)
-        self.idxs = rng.sample(range(len(self.val_src_lines)), k)
+        self.idxs = list(range(k))
+        #k = min(self.num_examples, len(self.val_src_lines))
+        #rng = random.Random(seed)
+        #self.idxs = rng.sample(range(len(self.val_src_lines)), k)
 
     def on_evaluate(self, args, state, control, **kwargs):
         if self.num_examples <= 0:
