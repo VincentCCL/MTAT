@@ -95,7 +95,7 @@ def generate_batch(model, tokenizer, prompts, args):
         do_sample=do_sample,
         num_beams=args.num_beams,
         pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id
+        eos_token_id=tokenizer.eos_token_id,
     )
 
     if do_sample:
@@ -107,8 +107,15 @@ def generate_batch(model, tokenizer, prompts, args):
     with torch.no_grad():
         outputs = model.generate(**enc, **gen_kwargs)
 
-    decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-    return decoded
+    preds = []
+    input_lengths = enc["attention_mask"].sum(dim=1)
+
+    for i, out_ids in enumerate(outputs):
+        gen_ids = out_ids[input_lengths[i]:]
+        text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+        preds.append(text.strip())
+
+    return preds
 
 
 def main():
