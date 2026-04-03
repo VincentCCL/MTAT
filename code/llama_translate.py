@@ -168,9 +168,7 @@ def main():
 
         outputs = generate_batch(model, tokenizer, prompts, args)
 
-        for original_prompt, full_output in zip(prompts, outputs):
-            continuation = full_output[len(original_prompt):].strip()
-
+        for original_prompt, continuation in zip(prompts, outputs):
             cleaned = clean_output(
                 continuation,
                 strip_after_first_line=args.strip_after_first_line,
