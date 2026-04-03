@@ -89,7 +89,6 @@ def generate_batch(model, tokenizer, prompts, args):
     enc = {k: v.to(model.device) for k, v in enc.items()}
 
     do_sample = args.temperature > 0
-
     gen_kwargs = dict(
         max_new_tokens=args.max_new_tokens,
         do_sample=do_sample,
@@ -97,7 +96,6 @@ def generate_batch(model, tokenizer, prompts, args):
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
-
     if do_sample:
         gen_kwargs["temperature"] = args.temperature
         gen_kwargs["top_p"] = args.top_p
@@ -107,15 +105,17 @@ def generate_batch(model, tokenizer, prompts, args):
     with torch.no_grad():
         outputs = model.generate(**enc, **gen_kwargs)
 
-    preds = []
-    input_lengths = enc["attention_mask"].sum(dim=1)
+    # For left-padded batches, use the attention mask to get the true prompt length
+    input_lengths = enc["attention_mask"].sum(dim=1).tolist()
 
+    decoded_continuations = []
     for i, out_ids in enumerate(outputs):
-        gen_ids = out_ids[input_lengths[i]:]
+        prompt_len = input_lengths[i]
+        gen_ids = out_ids[prompt_len:]
         text = tokenizer.decode(gen_ids, skip_special_tokens=True)
-        preds.append(text.strip())
+        decoded_continuations.append(text)
 
-    return preds
+    return decoded_continuations
 
 
 def main():
