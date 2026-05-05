@@ -82,11 +82,21 @@ import argparse
 import json
 import os
 import random
+import sys
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Sequence, Set
+import subprocess
 
 import numpy as np
 import torch
+
+try:
+    import yaml
+except Exception:
+    yaml = None
+
+import transformers
 from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
@@ -494,6 +504,7 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
         raise ValueError(f"Validation src/tgt line counts differ: {len(val_src)} vs {len(val_tgt)}")
 
     os.makedirs(args.save, exist_ok=True)
+    save_run_config(args)
 
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model, use_fast=True)
     model = AutoModelForSeq2SeqLM.from_pretrained(args.pretrained_model)
@@ -716,6 +727,147 @@ def translate_hf_seq2seq(args: argparse.Namespace) -> None:
                 print(f"{name}: {score:.2f}")
 
 
+
+# ---------------------------------------------------------------------
+# Config logging / YAML config loading
+# ---------------------------------------------------------------------
+
+def serializable_config(args: argparse.Namespace) -> Dict[str, object]:
+    config = dict(vars(args))
+
+    config["_metadata"] = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "python": sys.version.replace("\n", " "),
+        "torch_version": torch.__version__,
+        "transformers_version": transformers.__version__,
+    }
+
+    try:
+        config["_metadata"]["git_commit"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8").strip()
+    except Exception:
+        config["_metadata"]["git_commit"] = None
+
+    return config
+
+
+def save_run_config(args: argparse.Namespace) -> None:
+    """
+    Save the fully resolved configuration, including argparse defaults,
+    to the run directory.
+    """
+    if not hasattr(args, "save") or args.save is None:
+        return
+
+    os.makedirs(args.save, exist_ok=True)
+    config = serializable_config(args)
+
+    json_path = os.path.join(args.save, "config.json")
+    txt_path = os.path.join(args.save, "config.txt")
+    yaml_path = os.path.join(args.save, "config.yaml")
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+
+    with open(txt_path, "w", encoding="utf-8") as f:
+        for key in sorted(k for k in config.keys() if k != "_metadata"):
+            f.write(f"{key}: {config[key]}\n")
+        f.write("\n[_metadata]\n")
+        for key in sorted(config["_metadata"].keys()):
+            f.write(f"{key}: {config['_metadata'][key]}\n")
+
+    if yaml is not None:
+        with open(yaml_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(config, f, sort_keys=False, allow_unicode=True)
+        print(f"Saved run config to {yaml_path}")
+    else:
+        print("WARNING: PyYAML is not installed; config.yaml was not written.")
+        print("Install with: pip install pyyaml")
+
+    print(f"Saved run config to {json_path}")
+    print(f"Saved run config to {txt_path}")
+
+
+def load_yaml_config(path: str) -> Dict[str, object]:
+    if yaml is None:
+        raise RuntimeError("Using --config requires PyYAML. Install with: pip install pyyaml")
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+
+    if data is None:
+        return {}
+
+    if not isinstance(data, dict):
+        raise ValueError(f"Config file should contain a YAML mapping/dictionary: {path}")
+
+    # Metadata is saved for reproducibility, but should not be parsed as CLI args.
+    data.pop("_metadata", None)
+
+    return data
+
+
+def config_to_cli_args(config: Dict[str, object]) -> List[str]:
+    """
+    Convert YAML config values to argparse-style command-line arguments.
+
+    This lets a saved config.yaml act as a rerunnable CLI command.
+    Values explicitly supplied on the command line after --config override
+    the YAML values.
+    """
+    cli: List[str] = []
+
+    command = config.pop("command", None)
+
+    # Boolean flags need special care. False means: omit flag.
+    for key, value in config.items():
+        if value is None:
+            continue
+
+        option = "--" + key.replace("_", "-")
+
+        if isinstance(value, bool):
+            if value:
+                cli.append(option)
+            continue
+
+        if isinstance(value, list):
+            for item in value:
+                cli.extend([option, str(item)])
+            continue
+
+        cli.extend([option, str(value)])
+
+    if command:
+        return [str(command)] + cli
+
+    return cli
+
+
+def parse_args_with_optional_config(parser: argparse.ArgumentParser) -> argparse.Namespace:
+    """
+    First parse only --config, then combine:
+      1. YAML config values
+      2. explicit CLI values, which override YAML values
+    """
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=None, help="YAML config file from a previous run")
+    known, remaining = pre.parse_known_args()
+
+    if known.config is None:
+        return parser.parse_args()
+
+    config = load_yaml_config(known.config)
+    yaml_cli = config_to_cli_args(config)
+
+    # Explicit CLI options come last, so argparse lets them override earlier values.
+    args = parser.parse_args(yaml_cli + remaining)
+    args.config = known.config
+    return args
+
+
 # ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
@@ -749,6 +901,11 @@ def add_prefix_args(ap: argparse.ArgumentParser) -> None:
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="Unified MTAT CLI for training, finetuning and translating MT models."
+    )
+    ap.add_argument(
+        "--config",
+        default=None,
+        help="YAML config file. CLI arguments supplied after --config override the YAML values.",
     )
     sub = ap.add_subparsers(dest="command", required=True)
 
@@ -825,7 +982,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     parser = build_arg_parser()
-    args = parser.parse_args()
+    args = parse_args_with_optional_config(parser)
 
     if args.command == "finetune":
         finetune_hf_seq2seq(args)
