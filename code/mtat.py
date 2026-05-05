@@ -99,8 +99,10 @@ from transformers import (
 
 try:
     import sacrebleu
+    from sacrebleu.metrics import TER
 except Exception:
     sacrebleu = None
+    TER = None
 
 
 HF_SEQ2SEQ_TYPES = {"t5", "mbart", "m2m", "nllb", "madlad"}
@@ -191,6 +193,12 @@ def compute_sacrebleu_metrics(
 
     if "chrf" in requested or "chrf++" in requested:
         output["chrf"] = float(sacrebleu.corpus_chrf(predictions, ref_streams).score)
+
+    if "ter" in requested:
+        if TER is None:
+            raise RuntimeError("TER metric is unavailable. Please upgrade sacrebleu: pip install -U sacrebleu")
+        ter = TER()
+        output["ter"] = float(ter.corpus_score(predictions, ref_streams).score)
 
     return output
 
@@ -355,6 +363,114 @@ class ShowValExamplesCallback(TrainerCallback):
             print(f"\nSRC: {src}\nREF: {ref}\nHYP: {hyp}")
 
 
+
+class SaveEvalTranslationsCallback(TrainerCallback):
+    """
+    During training, save validation translations and metric scores whenever
+    Trainer evaluates.
+
+    Files are written as:
+
+      eval_translations/eval_step_500.src
+      eval_translations/eval_step_500.ref
+      eval_translations/eval_step_500.hyp
+      eval_translations/eval_step_500.scores.json
+    """
+
+    def __init__(
+        self,
+        tokenizer,
+        model_type: str,
+        src_lang: Optional[str],
+        tgt_lang: Optional[str],
+        val_src: List[str],
+        val_tgt: List[str],
+        out_dir: str,
+        metrics: Set[str],
+        batch_size: int,
+        max_src_len: int,
+        max_gen_len: int,
+        num_beams: int,
+        prefix: str = "",
+    ):
+        self.tokenizer = tokenizer
+        self.model_type = model_type
+        self.src_lang = src_lang
+        self.tgt_lang = tgt_lang
+        self.val_src = val_src
+        self.val_tgt = val_tgt
+        self.out_dir = out_dir
+        self.metrics = metrics
+        self.batch_size = batch_size
+        self.max_src_len = max_src_len
+        self.max_gen_len = max_gen_len
+        self.num_beams = num_beams
+        self.prefix = prefix
+
+        os.makedirs(self.out_dir, exist_ok=True)
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        model = kwargs["model"]
+        model.eval()
+        device = model.device
+
+        forced_bos_token_id = resolve_forced_bos_token_id(
+            self.tokenizer,
+            self.model_type,
+            self.tgt_lang,
+        )
+
+        hyps: List[str] = []
+
+        with torch.no_grad():
+            for batch in batched(self.val_src, self.batch_size):
+                batch_in = [self.prefix + line for line in batch]
+                enc = self.tokenizer(
+                    batch_in,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_src_len,
+                ).to(device)
+
+                generation_kwargs = {
+                    "num_beams": self.num_beams,
+                    "max_new_tokens": self.max_gen_len,
+                }
+                if forced_bos_token_id is not None:
+                    generation_kwargs["forced_bos_token_id"] = forced_bos_token_id
+
+                gen = model.generate(**enc, **generation_kwargs)
+                texts = self.tokenizer.batch_decode(
+                    gen,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=True,
+                )
+                hyps.extend([x.strip() for x in texts])
+
+        step = int(state.global_step)
+        stem = os.path.join(self.out_dir, f"eval_step_{step}")
+
+        write_lines(stem + ".src", self.val_src)
+        write_lines(stem + ".ref", self.val_tgt)
+        write_lines(stem + ".hyp", hyps)
+
+        scores = compute_sacrebleu_metrics(hyps, self.val_tgt, self.metrics)
+        scores["step"] = step
+        scores["epoch"] = float(state.epoch) if state.epoch is not None else None
+
+        with open(stem + ".scores.json", "w", encoding="utf-8") as f:
+            json.dump(scores, f, indent=2, ensure_ascii=False)
+
+        print(f"\nSaved validation translations to {stem}.hyp")
+        print("Validation translation scores:")
+        for key, value in scores.items():
+            if isinstance(value, float):
+                print(f"  {key}: {value:.4f}")
+            else:
+                print(f"  {key}: {value}")
+
+
 # ---------------------------------------------------------------------
 # Fine-tuning
 # ---------------------------------------------------------------------
@@ -474,6 +590,32 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
                 max_gen_len=args.max_gen_len,
                 prefix=prefix,
                 seed=args.seed,
+            )
+        )
+
+    if args.save_eval_translations:
+        if sacrebleu is None:
+            raise RuntimeError("Saving eval translation scores requires sacrebleu: pip install sacrebleu")
+
+        eval_translations_dir = args.eval_translations_dir
+        if eval_translations_dir is None:
+            eval_translations_dir = os.path.join(args.save, "eval_translations")
+
+        trainer.add_callback(
+            SaveEvalTranslationsCallback(
+                tokenizer=tokenizer,
+                model_type=args.model_type,
+                src_lang=args.src_lang,
+                tgt_lang=args.tgt_lang,
+                val_src=val_src,
+                val_tgt=val_tgt,
+                out_dir=eval_translations_dir,
+                metrics=requested_metrics or parse_metrics(args.metrics),
+                batch_size=eval_batch_size,
+                max_src_len=args.max_src_len,
+                max_gen_len=args.eval_max_gen_len,
+                num_beams=args.eval_num_beams,
+                prefix=prefix,
             )
         )
 
@@ -641,7 +783,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ft.add_argument("--eval-max-gen-len", type=int, default=64)
 
     ft.add_argument("--eval-metrics", action="store_true")
-    ft.add_argument("--metrics", default="bleu,chrf")
+    ft.add_argument("--metrics", default="bleu,chrf,ter")
     ft.add_argument("--no-generate", action="store_true")
     ft.add_argument("--eval-disabled", action="store_true")
     ft.add_argument("--eval-strategy", default="steps", choices=["no", "steps", "epoch"])
@@ -653,6 +795,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ft.add_argument("--save-only-model", action="store_true")
     ft.add_argument("--history-json", default=None)
     ft.add_argument("--show-val-examples", type=int, default=0)
+    ft.add_argument(
+        "--save-eval-translations",
+        action="store_true",
+        help="Save validation translations at every evaluation point",
+    )
+    ft.add_argument(
+        "--eval-translations-dir",
+        default=None,
+        help="Directory for validation translations; default: <save>/eval_translations",
+    )
     ft.add_argument("--gradient-checkpointing", action="store_true")
 
     # translate
@@ -666,7 +818,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     add_common_generation_args(tr)
     tr.add_argument("--device", default=None, choices=["cpu", "cuda"])
     tr.add_argument("--ref-file", default=None)
-    tr.add_argument("--metrics", default="bleu,chrf")
+    tr.add_argument("--metrics", default="bleu,chrf,ter")
 
     return ap
 
