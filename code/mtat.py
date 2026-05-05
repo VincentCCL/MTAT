@@ -828,14 +828,38 @@ def resolve_resume_checkpoint(args: argparse.Namespace) -> Optional[str]:
 # Config logging / YAML config loading
 # ---------------------------------------------------------------------
 
+def make_yaml_safe(value):
+    """
+    Recursively convert values to plain YAML-safe Python types.
+    This avoids PyYAML crashes on version objects, paths, numpy scalars, etc.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, dict):
+        return {str(k): make_yaml_safe(v) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [make_yaml_safe(v) for v in value]
+
+    # numpy scalar support, without requiring numpy-specific logic elsewhere
+    if hasattr(value, "item"):
+        try:
+            return make_yaml_safe(value.item())
+        except Exception:
+            pass
+
+    return str(value)
+
+
 def serializable_config(args: argparse.Namespace) -> Dict[str, object]:
     config = dict(vars(args))
 
     config["_metadata"] = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "python": sys.version.replace("\n", " "),
-        "torch_version": torch.__version__,
-        "transformers_version": transformers.__version__,
+        "torch_version": str(torch.__version__),
+        "transformers_version": str(transformers.__version__),
     }
 
     try:
@@ -846,7 +870,7 @@ def serializable_config(args: argparse.Namespace) -> Dict[str, object]:
     except Exception:
         config["_metadata"]["git_commit"] = None
 
-    return config
+    return make_yaml_safe(config)
 
 
 def save_run_config(args: argparse.Namespace) -> None:
