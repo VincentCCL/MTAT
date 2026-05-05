@@ -79,6 +79,7 @@ Translate with T5:
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import random
@@ -86,6 +87,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Sequence, Set
+import re
 import subprocess
 
 import numpy as np
@@ -504,7 +506,6 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
         raise ValueError(f"Validation src/tgt line counts differ: {len(val_src)} vs {len(val_tgt)}")
 
     os.makedirs(args.save, exist_ok=True)
-    save_run_config(args)
 
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model, use_fast=True)
     model = AutoModelForSeq2SeqLM.from_pretrained(args.pretrained_model)
@@ -631,7 +632,12 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
         )
 
     print("Model device before training:", next(model.parameters()).device)
-    trainer.train()
+
+    resume_checkpoint = resolve_resume_checkpoint(args)
+    args.resolved_resume_from_checkpoint = resume_checkpoint
+    save_run_config(args)
+
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
 
     if not args.eval_disabled:
         print("\nFinal evaluation:")
@@ -725,6 +731,96 @@ def translate_hf_seq2seq(args: argparse.Namespace) -> None:
             scores = compute_sacrebleu_metrics(outputs, ref_lines, requested_metrics)
             for name, score in scores.items():
                 print(f"{name}: {score:.2f}")
+
+
+
+
+# ---------------------------------------------------------------------
+# Checkpoint / continuation helpers
+# ---------------------------------------------------------------------
+
+def checkpoint_step(path: str) -> int:
+    """
+    Extract numeric step from a Hugging Face Trainer checkpoint directory.
+
+    Example:
+      checkpoint-500 -> 500
+    """
+    base = os.path.basename(os.path.normpath(path))
+    match = re.match(r"checkpoint-(\d+)$", base)
+    if not match:
+        return -1
+    return int(match.group(1))
+
+
+def find_latest_checkpoint(run_dir: str) -> Optional[str]:
+    """
+    Return the latest checkpoint-* directory inside run_dir, or None.
+    """
+    pattern = os.path.join(run_dir, "checkpoint-*")
+    checkpoints = [
+        path for path in glob.glob(pattern)
+        if os.path.isdir(path) and checkpoint_step(path) >= 0
+    ]
+
+    if not checkpoints:
+        return None
+
+    return max(checkpoints, key=checkpoint_step)
+
+
+def resolve_resume_checkpoint(args: argparse.Namespace) -> Optional[str]:
+    """
+    Decide whether Trainer should resume from a checkpoint.
+
+    Supported modes:
+
+      --resume-from-checkpoint PATH
+          Resume exactly from PATH.
+
+      --resume-from-checkpoint latest
+          Resume from the latest checkpoint inside --save.
+
+      --auto-resume
+          If --save contains checkpoint-* directories, resume from the latest one.
+
+      no option
+          Start a new Trainer run.
+
+    Note:
+      This is different from using --pretrained-model <run_dir>, which loads
+      model weights but does not restore optimizer/scheduler/trainer state.
+    """
+    resume = getattr(args, "resume_from_checkpoint", None)
+
+    if resume:
+        if str(resume).lower() == "latest":
+            latest = find_latest_checkpoint(args.save)
+            if latest is None:
+                raise ValueError(
+                    f"--resume-from-checkpoint latest was requested, "
+                    f"but no checkpoint-* directories were found in {args.save}"
+                )
+            print(f"Resuming from latest checkpoint: {latest}")
+            return latest
+
+        if not os.path.isdir(resume):
+            raise ValueError(f"Checkpoint directory does not exist: {resume}")
+
+        print(f"Resuming from checkpoint: {resume}")
+        return resume
+
+    if getattr(args, "auto_resume", False):
+        latest = find_latest_checkpoint(args.save)
+        if latest is not None:
+            print(f"Auto-resuming from latest checkpoint: {latest}")
+            return latest
+
+        print(f"--auto-resume was set, but no checkpoint-* directories were found in {args.save}")
+        print("Starting a new training run instead.")
+        return None
+
+    return None
 
 
 
@@ -912,7 +1008,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # finetune
     ft = sub.add_parser("finetune", help="Fine-tune a pretrained seq2seq model")
     ft.add_argument("--model-type", required=True, choices=sorted(HF_SEQ2SEQ_TYPES))
-    ft.add_argument("--pretrained-model", required=True)
+    ft.add_argument(
+        "--pretrained-model",
+        required=True,
+        help=(
+            "Base model or saved model directory. "
+            "Use an original HF checkpoint for a new fine-tuning run, or a previous "
+            "run directory to continue from saved weights without optimizer state."
+        ),
+    )
+    ft.add_argument(
+        "--resume-from-checkpoint",
+        default=None,
+        help=(
+            "Resume full Trainer state from a checkpoint directory, e.g. "
+            "runs/exp/checkpoint-1000. Use 'latest' to pick the latest checkpoint "
+            "inside --save."
+        ),
+    )
+    ft.add_argument(
+        "--auto-resume",
+        action="store_true",
+        help=(
+            "Automatically resume from the latest checkpoint-* directory inside --save "
+            "if one exists. If none exists, start a new run."
+        ),
+    )
     add_common_data_args(ft)
     ft.add_argument("--tgt-file", required=True, help="Target training file")
     ft.add_argument("--src-val", required=True, help="Source validation file")
