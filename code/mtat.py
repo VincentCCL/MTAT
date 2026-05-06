@@ -666,7 +666,7 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
             )
         )
 
-    if args.save_eval_translations:
+    """ if args.save_eval_translations:
         if sacrebleu is None:
             raise RuntimeError("Saving eval translation scores requires sacrebleu: pip install sacrebleu")
 
@@ -691,7 +691,7 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
                 prefix=prefix,
             )
         )
-
+ """
     print("Model device before training:", next(model.parameters()).device)
 
     resume_checkpoint = resolve_resume_checkpoint(args)
