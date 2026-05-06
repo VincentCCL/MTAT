@@ -89,6 +89,7 @@ from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Sequence, Set
 import re
 import subprocess
+from tqdm.auto import tqdm
 
 import numpy as np
 import torch
@@ -690,7 +691,12 @@ def translate_hf_seq2seq(args: argparse.Namespace) -> None:
     outputs: List[str] = []
 
     with torch.no_grad():
-        for batch in batched(src_lines, args.batch_size):
+        
+        for batch in tqdm(
+            batched(src_lines, args.batch_size),
+            total=(len(src_lines) + args.batch_size - 1) // args.batch_size,
+            desc="Translating",
+        ):
             batch_in = [prefix + line for line in batch]
 
             enc = tokenizer(
