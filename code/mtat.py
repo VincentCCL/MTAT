@@ -659,11 +659,33 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
     tokenizer.save_pretrained(args.save)
 
     if args.history_json:
+        # --------------------------------------------------------------
+        # Load existing history if resuming training
+        # --------------------------------------------------------------
+        existing_history = []
+
+        if os.path.exists(args.history_json):
+
+            try:
+                with open(args.history_json, "r", encoding="utf-8") as f:
+                    existing_history = json.load(f)
+
+                print(f"Loaded existing history from {args.history_json}")
+
+            except Exception as e:
+                print(f"WARNING: could not load existing history: {e}")
+                existing_history = []
+
+        # --------------------------------------------------------------
+        # Merge old + new history
+        # --------------------------------------------------------------
+
+        combined_history = existing_history + trainer.state.log_history
+
         with open(args.history_json, "w", encoding="utf-8") as f:
-            json.dump(trainer.state.log_history, f, indent=2, ensure_ascii=False)
-        print(f"\nWrote training history to {args.history_json}")
+            json.dump(combined_history, f, indent=2, ensure_ascii=False)
 
-
+        print(f"\nWrote merged training history to {args.history_json}")
 # ---------------------------------------------------------------------
 # Translation
 # ---------------------------------------------------------------------
