@@ -578,8 +578,20 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
         if sacrebleu is None:
             print("WARNING: sacrebleu is not installed; BLEU/chrF will be skipped.")
         else:
-            compute_metrics = build_compute_metrics_fn(tokenizer, requested_metrics)
+            eval_translations_dir = None
 
+            if args.save_eval_translations:
+                eval_translations_dir = args.eval_translations_dir
+                if eval_translations_dir is None:
+                    eval_translations_dir = os.path.join(args.save, "eval_translations")
+
+            compute_metrics = build_compute_metrics_fn(
+                tokenizer,
+                requested_metrics,
+                save_predictions_dir=eval_translations_dir,
+                val_src=val_src,
+            )
+            
     eval_batch_size = args.eval_batch_size if args.eval_batch_size is not None else args.batch_size
 
     training_args = Seq2SeqTrainingArguments(
