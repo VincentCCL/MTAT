@@ -277,10 +277,13 @@ def compute_sacrebleu_metrics(
     references: List[str],
     requested: Set[str],
 ) -> Dict[str, float]:
+    output: Dict[str, float] = {}
+    if not requested:
+        return output
+
     if sacrebleu is None:
         raise RuntimeError("sacrebleu is not installed. Install it with: pip install sacrebleu")
 
-    output: Dict[str, float] = {}
     ref_streams = [references]
 
     if "bleu" in requested:
@@ -302,8 +305,10 @@ def build_compute_metrics_fn(
     requested: Set[str],
     save_predictions_dir: Optional[str] = None,
     val_src: Optional[List[str]] = None,
+    show_example_indices: Optional[List[int]] = None,
 ):
     eval_counter = {"n": 0}
+    show_example_indices = show_example_indices or []
 
     def compute_metrics(eval_pred):
         eval_counter["n"] += 1
@@ -322,6 +327,14 @@ def build_compute_metrics_fn(
         ref_str = [x.strip() for x in ref_str]
 
         metrics = compute_sacrebleu_metrics(pred_str, ref_str, requested)
+
+        if show_example_indices:
+            print(f"\n=== Validation examples @ evaluation {eval_counter['n']:03d} ===")
+            for i in show_example_indices:
+                if i >= len(pred_str):
+                    continue
+                src = val_src[i] if val_src is not None else f"<source {i}>"
+                print(f"\nSRC: {src}\nREF: {ref_str[i]}\nHYP: {pred_str[i]}")
 
         if save_predictions_dir is not None:
             os.makedirs(save_predictions_dir, exist_ok=True)
@@ -677,23 +690,38 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
 
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
 
-    requested_metrics = parse_metrics(args.metrics) if (args.eval_metrics or args.save_eval_translations) else set()
+    requested_metrics = parse_metrics(args.metrics) if args.eval_metrics else set()
     compute_metrics = None
-    if args.eval_metrics or args.save_eval_translations:
+    eval_translations_dir = None
+    examples_from_eval = (
+        args.show_val_examples > 0
+        and not args.eval_disabled
+        and not args.no_generate
+    )
+    should_decode_eval_predictions = args.eval_metrics or args.save_eval_translations or examples_from_eval
+
+    if should_decode_eval_predictions:
         if args.no_generate:
-            raise ValueError("--eval-metrics/--save-eval-translations require generation; remove --no-generate.")
-        if sacrebleu is None:
+            raise ValueError("Validation metrics/translations/examples require generation; remove --no-generate.")
+        if requested_metrics and sacrebleu is None:
             raise RuntimeError("sacrebleu is required for validation metrics: pip install sacrebleu")
 
-        eval_translations_dir = None
         if args.save_eval_translations:
             eval_translations_dir = args.eval_translations_dir or os.path.join(args.save, "eval_translations")
+
+        example_indices = None
+        if examples_from_eval:
+            rng = random.Random(args.seed)
+            idxs = list(range(len(val_src)))
+            rng.shuffle(idxs)
+            example_indices = idxs[: min(args.show_val_examples, len(val_src))]
 
         compute_metrics = build_compute_metrics_fn(
             tokenizer,
             requested_metrics,
             save_predictions_dir=eval_translations_dir,
             val_src=val_src,
+            show_example_indices=example_indices,
         )
 
     eval_batch_size = args.eval_batch_size if args.eval_batch_size is not None else args.batch_size
@@ -740,7 +768,10 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
                 early_stopping_threshold=args.early_stopping_threshold,
             )
         )
-    if args.show_val_examples > 0:
+    # If evaluation generation is active, examples are printed inside
+    # compute_metrics from the already-generated validation predictions.
+    # This avoids generating the same examples before the full validation pass.
+    if args.show_val_examples > 0 and not examples_from_eval:
         trainer.add_callback(
             ShowValExamplesCallback(
                 tokenizer=tokenizer,
@@ -762,8 +793,8 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
             )
         )
 
-    # Validation translations are saved by compute_metrics, so no extra
-    # generation callback is needed.
+    # Validation translations, scores, and printed examples are handled by
+    # compute_metrics whenever the Trainer already generated predictions.
 
     print("Model device before training:", next(model.parameters()).device)
 
