@@ -964,15 +964,15 @@ def save_run_config(args: argparse.Namespace) -> None:
     #txt_path = os.path.join(args.save, "config.txt")
     yaml_path = os.path.join(args.save, "config.yaml")
 
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
+   # with open(json_path, "w", encoding="utf-8") as f:
+   #     json.dump(config, f, indent=2, ensure_ascii=False)
 
-    with open(txt_path, "w", encoding="utf-8") as f:
-        for key in sorted(k for k in config.keys() if k != "_metadata"):
-            f.write(f"{key}: {config[key]}\n")
-        f.write("\n[_metadata]\n")
-        for key in sorted(config["_metadata"].keys()):
-            f.write(f"{key}: {config['_metadata'][key]}\n")
+    #with open(txt_path, "w", encoding="utf-8") as f:
+    #    for key in sorted(k for k in config.keys() if k != "_metadata"):
+    #        f.write(f"{key}: {config[key]}\n")
+    #    f.write("\n[_metadata]\n")
+    #    for key in sorted(config["_metadata"].keys()):
+    #        f.write(f"{key}: {config['_metadata'][key]}\n")
 
     if yaml is not None:
         with open(yaml_path, "w", encoding="utf-8") as f:
@@ -982,8 +982,8 @@ def save_run_config(args: argparse.Namespace) -> None:
         print("WARNING: PyYAML is not installed; config.yaml was not written.")
         print("Install with: pip install pyyaml")
 
-    print(f"Saved run config to {json_path}")
-    print(f"Saved run config to {txt_path}")
+    #print(f"Saved run config to {json_path}")
+    #print(f"Saved run config to {txt_path}")
 
 
 def load_yaml_config(path: str) -> Dict[str, object]:
