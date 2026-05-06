@@ -139,6 +139,34 @@ def write_lines(path: str, lines: Sequence[str]) -> None:
             f.write(line + "\n")
 
 
+def write_lines_if_missing(path: str, lines: Sequence[str]) -> None:
+    """Write immutable helper files such as validation source/reference once."""
+    if os.path.exists(path):
+        return
+    write_lines(path, lines)
+
+
+def latest_hyp_file(directory: Optional[str]) -> Optional[str]:
+    """Return the most recently updated validation hypothesis file, if any."""
+    if not directory or not os.path.isdir(directory):
+        return None
+    candidates = glob.glob(os.path.join(directory, "*.hyp"))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: (os.path.getmtime(path), path))
+
+
+def load_existing_hypotheses(directory: Optional[str], expected_len: int) -> Tuple[Optional[str], Optional[List[str]]]:
+    """Load the latest complete validation hypothesis file for reuse."""
+    hyp_path = latest_hyp_file(directory)
+    if hyp_path is None:
+        return None, None
+    hyps = read_lines(hyp_path)
+    if len(hyps) != expected_len:
+        return None, None
+    return hyp_path, hyps
+
+
 def batched(xs: Sequence[str], batch_size: int) -> Iterable[Sequence[str]]:
     for i in range(0, len(xs), batch_size):
         yield xs[i : i + batch_size]
@@ -298,15 +326,13 @@ def build_compute_metrics_fn(
         if save_predictions_dir is not None:
             os.makedirs(save_predictions_dir, exist_ok=True)
 
-            stem = os.path.join(
-                save_predictions_dir,
-                f"eval_{eval_counter['n']:03d}",
-            )
-
+            # Source and reference are invariant across validation runs, so keep
+            # a single copy and only write per-evaluation hypotheses/scores.
             if val_src is not None:
-                write_lines(stem + ".src", val_src)
+                write_lines_if_missing(os.path.join(save_predictions_dir, "validation.src"), val_src)
+            write_lines_if_missing(os.path.join(save_predictions_dir, "validation.ref"), ref_str)
 
-            write_lines(stem + ".ref", ref_str)
+            stem = os.path.join(save_predictions_dir, f"eval_{eval_counter['n']:03d}")
             write_lines(stem + ".hyp", pred_str)
 
             with open(stem + ".scores.json", "w", encoding="utf-8") as f:
@@ -396,6 +422,7 @@ class ShowValExamplesCallback(TrainerCallback):
         max_gen_len: int,
         prefix: str = "",
         seed: int = 42,
+        reuse_translations_dir: Optional[str] = None,
     ):
         self.tokenizer = tokenizer
         self.model_type = model_type
@@ -408,6 +435,7 @@ class ShowValExamplesCallback(TrainerCallback):
         self.num_beams = num_beams
         self.max_gen_len = max_gen_len
         self.prefix = prefix
+        self.reuse_translations_dir = reuse_translations_dir
 
         rng = random.Random(seed)
         idxs = list(range(len(val_src)))
@@ -430,11 +458,23 @@ class ShowValExamplesCallback(TrainerCallback):
 
         print(f"\n=== Validation examples @ epoch {state.epoch:.2f} ===")
 
+        hyp_path, existing_hyps = load_existing_hypotheses(
+            self.reuse_translations_dir,
+            expected_len=len(self.val_src),
+        )
+        if existing_hyps is not None:
+            print(f"Reusing validation translations from {hyp_path}")
+
         for i in self.fixed_idxs:
             src = self.val_src[i]
             ref = self.val_tgt[i]
-            src_in = self.prefix + src
 
+            if existing_hyps is not None:
+                hyp = existing_hyps[i].strip()
+                print(f"\nSRC: {src}\nREF: {ref}\nHYP: {hyp}")
+                continue
+
+            src_in = self.prefix + src
             enc = self.tokenizer(
                 src_in,
                 return_tensors="pt",
@@ -449,7 +489,7 @@ class ShowValExamplesCallback(TrainerCallback):
             if forced_bos_token_id is not None:
                 generation_kwargs["forced_bos_token_id"] = forced_bos_token_id
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 gen = model.generate(**enc, **generation_kwargs)
 
             hyp = self.tokenizer.batch_decode(gen, skip_special_tokens=True)[0]
@@ -544,8 +584,8 @@ class SaveEvalTranslationsCallback(TrainerCallback):
         step = int(state.global_step)
         stem = os.path.join(self.out_dir, f"eval_step_{step}")
 
-        write_lines(stem + ".src", self.val_src)
-        write_lines(stem + ".ref", self.val_tgt)
+        write_lines_if_missing(os.path.join(self.out_dir, "validation.src"), self.val_src)
+        write_lines_if_missing(os.path.join(self.out_dir, "validation.ref"), self.val_tgt)
         write_lines(stem + ".hyp", hyps)
 
         scores = {
@@ -715,6 +755,10 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
                 max_gen_len=args.max_gen_len,
                 prefix=prefix,
                 seed=args.seed,
+                reuse_translations_dir=(
+                    args.eval_translations_dir or os.path.join(args.save, "eval_translations")
+                    if args.save_eval_translations else None
+                ),
             )
         )
 
