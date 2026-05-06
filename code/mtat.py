@@ -921,8 +921,8 @@ def save_run_config(args: argparse.Namespace) -> None:
     os.makedirs(args.save, exist_ok=True)
     config = serializable_config(args)
 
-    json_path = os.path.join(args.save, "config.json")
-    txt_path = os.path.join(args.save, "config.txt")
+    #json_path = os.path.join(args.save, "config.json")
+    #txt_path = os.path.join(args.save, "config.txt")
     yaml_path = os.path.join(args.save, "config.yaml")
 
     with open(json_path, "w", encoding="utf-8") as f:
