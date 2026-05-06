@@ -700,12 +700,12 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
 
     trainer.train(resume_from_checkpoint=resume_checkpoint)
 
-    if not args.eval_disabled:
+    if not args.eval_disabled and args.eval_strategy == "no":
         print("\nFinal evaluation:")
         eval_out = trainer.evaluate()
         for key, value in eval_out.items():
             print(f"  {key}: {value}")
-
+    
     trainer.save_model(args.save)
     tokenizer.save_pretrained(args.save)
 
