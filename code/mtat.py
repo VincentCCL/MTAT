@@ -216,9 +216,17 @@ def compute_sacrebleu_metrics(
 
     return output
 
+def build_compute_metrics_fn(
+    tokenizer,
+    requested: Set[str],
+    save_predictions_dir: Optional[str] = None,
+    val_src: Optional[List[str]] = None,
+):
+    eval_counter = {"n": 0}
 
-def build_compute_metrics_fn(tokenizer, requested: Set[str]):
     def compute_metrics(eval_pred):
+        eval_counter["n"] += 1
+
         preds, labels = eval_pred
 
         if isinstance(preds, tuple):
@@ -232,10 +240,28 @@ def build_compute_metrics_fn(tokenizer, requested: Set[str]):
         pred_str = [x.strip() for x in pred_str]
         ref_str = [x.strip() for x in ref_str]
 
-        return compute_sacrebleu_metrics(pred_str, ref_str, requested)
+        metrics = compute_sacrebleu_metrics(pred_str, ref_str, requested)
+
+        if save_predictions_dir is not None:
+            os.makedirs(save_predictions_dir, exist_ok=True)
+
+            stem = os.path.join(
+                save_predictions_dir,
+                f"eval_{eval_counter['n']:03d}",
+            )
+
+            if val_src is not None:
+                write_lines(stem + ".src", val_src)
+
+            write_lines(stem + ".ref", ref_str)
+            write_lines(stem + ".hyp", pred_str)
+
+            with open(stem + ".scores.json", "w", encoding="utf-8") as f:
+                json.dump(metrics, f, indent=2, ensure_ascii=False)
+
+        return metrics
 
     return compute_metrics
-
 
 # ---------------------------------------------------------------------
 # Model-specific language handling
@@ -469,13 +495,14 @@ class SaveEvalTranslationsCallback(TrainerCallback):
         write_lines(stem + ".ref", self.val_tgt)
         write_lines(stem + ".hyp", hyps)
 
-        scores = compute_sacrebleu_metrics(hyps, self.val_tgt, self.metrics)
-        scores["step"] = step
-        scores["epoch"] = float(state.epoch) if state.epoch is not None else None
+        scores = {
+            "step": step,
+            "epoch": float(state.epoch) if state.epoch is not None else None,
+            "note": "Scores are already available in Trainer eval logs.",
+        }
 
         with open(stem + ".scores.json", "w", encoding="utf-8") as f:
             json.dump(scores, f, indent=2, ensure_ascii=False)
-
         print(f"\nSaved validation translations to {stem}.hyp")
         print("Validation translation scores:")
         for key, value in scores.items():
