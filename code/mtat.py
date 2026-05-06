@@ -108,6 +108,7 @@ from transformers import (
     Seq2SeqTrainingArguments,
     TrainerCallback,
     set_seed,
+    EarlyStoppingCallback
 )
 
 try:
@@ -575,7 +576,9 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
         generation_num_beams=args.eval_num_beams,
         generation_max_length=args.eval_max_gen_len,
         report_to=[],
-        load_best_model_at_end=False,
+        load_best_model_at_end=args.load_best_model_at_end,
+        metric_for_best_model=args.metric_for_best_model,
+        greater_is_better=args.greater_is_better,
         save_only_model=args.save_only_model,
     )
 
@@ -587,7 +590,13 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
         data_collator=data_collator,
         compute_metrics=compute_metrics,
     )
-
+    if args.early_stopping_patience is not None:
+        trainer.add_callback(
+            EarlyStoppingCallback(
+                early_stopping_patience=args.early_stopping_patience,
+                early_stopping_threshold=args.early_stopping_threshold,
+            )
+        )
     if args.show_val_examples > 0:
         trainer.add_callback(
             ShowValExamplesCallback(
@@ -1114,7 +1123,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Directory for validation translations; default: <save>/eval_translations",
     )
     ft.add_argument("--gradient-checkpointing", action="store_true")
-
+    ft.add_argument("--load-best-model-at-end", action="store_true")
+    ft.add_argument("--metric-for-best-model", default="bleu")
+    ft.add_argument("--greater-is-better", action="store_true")
+    ft.add_argument("--early-stopping-patience", type=int, default=None)
+    ft.add_argument("--early-stopping-threshold", type=float, default=0.0)
+    
     # translate
     tr = sub.add_parser("translate", help="Translate a source file with a model")
     tr.add_argument("--model-type", required=True, choices=sorted(HF_SEQ2SEQ_TYPES))
