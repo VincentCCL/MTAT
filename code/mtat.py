@@ -84,9 +84,8 @@ import json
 import os
 import random
 import sys
-from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional, Sequence, Set
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import re
 import subprocess
 from tqdm.auto import tqdm
@@ -145,6 +144,17 @@ def batched(xs: Sequence[str], batch_size: int) -> Iterable[Sequence[str]]:
         yield xs[i : i + batch_size]
 
 
+def batched_iter(xs: Iterable[str], batch_size: int) -> Iterable[List[str]]:
+    batch: List[str] = []
+    for x in xs:
+        batch.append(x)
+        if len(batch) == batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
 def parse_metrics(metrics: str) -> Set[str]:
     return {
         metric.strip().lower()
@@ -157,34 +167,77 @@ def parse_metrics(metrics: str) -> Set[str]:
 # Dataset
 # ---------------------------------------------------------------------
 
-@dataclass
-class ParallelDataset(torch.utils.data.Dataset):
-    src: List[str]
-    tgt: List[str]
-    tokenizer: object
-    max_src_len: int
-    max_tgt_len: int
-    prefix: str = ""
+class EncodedParallelDataset(torch.utils.data.Dataset):
+    """
+    Parallel dataset that tokenizes once up front.
+
+    The original version tokenized source and target text inside __getitem__,
+    which repeats Python/tokenizer work every epoch. Pre-tokenizing is usually
+    faster for MT fine-tuning when the corpus fits in CPU memory.
+    """
+
+    def __init__(
+        self,
+        src: Sequence[str],
+        tgt: Sequence[str],
+        tokenizer,
+        max_src_len: int,
+        max_tgt_len: int,
+        prefix: str = "",
+    ) -> None:
+        if len(src) != len(tgt):
+            raise ValueError(f"Source/target line counts differ: {len(src)} vs {len(tgt)}")
+
+        src_texts = [prefix + line for line in src]
+
+        self.inputs = tokenizer(
+            src_texts,
+            max_length=max_src_len,
+            truncation=True,
+            padding=False,
+        )
+        self.labels = tokenizer(
+            text_target=list(tgt),
+            max_length=max_tgt_len,
+            truncation=True,
+            padding=False,
+        )["input_ids"]
 
     def __len__(self) -> int:
-        return len(self.src)
+        return len(self.labels)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        src_text = self.prefix + self.src[idx]
-        tgt_text = self.tgt[idx]
+    def __getitem__(self, idx: int) -> Dict[str, List[int]]:
+        item = {key: value[idx] for key, value in self.inputs.items()}
+        item["labels"] = self.labels[idx]
+        return item
 
-        model_inputs = self.tokenizer(
-            src_text,
-            max_length=self.max_src_len,
-            truncation=True,
-        )
-        labels = self.tokenizer(
-            text_target=tgt_text,
-            max_length=self.max_tgt_len,
-            truncation=True,
-        )
-        model_inputs["labels"] = labels["input_ids"]
-        return model_inputs
+
+def count_lines(path: str) -> int:
+    with open(path, "rb") as f:
+        return sum(1 for _ in f)
+
+
+def iter_lines(path: str, lower: bool = False) -> Iterable[str]:
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            text = line.rstrip("\n")
+            yield text.lower() if lower else text
+
+
+def build_training_arguments(**kwargs) -> Seq2SeqTrainingArguments:
+    """
+    Create Seq2SeqTrainingArguments across Transformers versions.
+
+    Newer versions use eval_strategy; older versions use evaluation_strategy.
+    """
+    import inspect
+
+    params = inspect.signature(Seq2SeqTrainingArguments.__init__).parameters
+    if "eval_strategy" not in params and "eval_strategy" in kwargs:
+        kwargs["evaluation_strategy"] = kwargs.pop("eval_strategy")
+    if "save_only_model" not in params:
+        kwargs.pop("save_only_model", None)
+    return Seq2SeqTrainingArguments(**kwargs)
 
 
 # ---------------------------------------------------------------------
@@ -565,7 +618,7 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
 
     prefix = "" if args.no_prefix else args.prefix
 
-    train_ds = ParallelDataset(
+    train_ds = EncodedParallelDataset(
         train_src,
         train_tgt,
         tokenizer,
@@ -573,7 +626,7 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
         args.max_tgt_len,
         prefix=prefix,
     )
-    val_ds = ParallelDataset(
+    val_ds = EncodedParallelDataset(
         val_src,
         val_tgt,
         tokenizer,
@@ -584,29 +637,28 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
 
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
 
-    requested_metrics = parse_metrics(args.metrics) if args.eval_metrics else set()
+    requested_metrics = parse_metrics(args.metrics) if (args.eval_metrics or args.save_eval_translations) else set()
     compute_metrics = None
-    if args.eval_metrics:
+    if args.eval_metrics or args.save_eval_translations:
+        if args.no_generate:
+            raise ValueError("--eval-metrics/--save-eval-translations require generation; remove --no-generate.")
         if sacrebleu is None:
-            print("WARNING: sacrebleu is not installed; BLEU/chrF will be skipped.")
-        else:
-            eval_translations_dir = None
+            raise RuntimeError("sacrebleu is required for validation metrics: pip install sacrebleu")
 
-            if args.save_eval_translations:
-                eval_translations_dir = args.eval_translations_dir
-                if eval_translations_dir is None:
-                    eval_translations_dir = os.path.join(args.save, "eval_translations")
+        eval_translations_dir = None
+        if args.save_eval_translations:
+            eval_translations_dir = args.eval_translations_dir or os.path.join(args.save, "eval_translations")
 
-            compute_metrics = build_compute_metrics_fn(
-                tokenizer,
-                requested_metrics,
-                save_predictions_dir=eval_translations_dir,
-                val_src=val_src,
-            )
-            
+        compute_metrics = build_compute_metrics_fn(
+            tokenizer,
+            requested_metrics,
+            save_predictions_dir=eval_translations_dir,
+            val_src=val_src,
+        )
+
     eval_batch_size = args.eval_batch_size if args.eval_batch_size is not None else args.batch_size
 
-    training_args = Seq2SeqTrainingArguments(
+    training_args = build_training_arguments(
         output_dir=args.save,
         num_train_epochs=args.epochs,
         learning_rate=args.lr,
@@ -666,32 +718,9 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
             )
         )
 
-    """ if args.save_eval_translations:
-        if sacrebleu is None:
-            raise RuntimeError("Saving eval translation scores requires sacrebleu: pip install sacrebleu")
+    # Validation translations are saved by compute_metrics, so no extra
+    # generation callback is needed.
 
-        eval_translations_dir = args.eval_translations_dir
-        if eval_translations_dir is None:
-            eval_translations_dir = os.path.join(args.save, "eval_translations")
-
-        trainer.add_callback(
-            SaveEvalTranslationsCallback(
-                tokenizer=tokenizer,
-                model_type=args.model_type,
-                src_lang=args.src_lang,
-                tgt_lang=args.tgt_lang,
-                val_src=val_src,
-                val_tgt=val_tgt,
-                out_dir=eval_translations_dir,
-                metrics=requested_metrics or parse_metrics(args.metrics),
-                batch_size=eval_batch_size,
-                max_src_len=args.max_src_len,
-                max_gen_len=args.eval_max_gen_len,
-                num_beams=args.eval_num_beams,
-                prefix=prefix,
-            )
-        )
- """
     print("Model device before training:", next(model.parameters()).device)
 
     resume_checkpoint = resolve_resume_checkpoint(args)
@@ -767,16 +796,18 @@ def translate_hf_seq2seq(args: argparse.Namespace) -> None:
     model.to(device)
     model.eval()
 
-    src_lines = read_lines(args.src_file, lower=args.lower)
     prefix = "" if args.no_prefix else args.prefix
+    total_lines = count_lines(args.src_file)
+    total_batches = (total_lines + args.batch_size - 1) // args.batch_size
 
+    collect_outputs = args.ref_file is not None
     outputs: List[str] = []
+    n_written = 0
 
-    with torch.no_grad():
-        
+    with torch.inference_mode(), open(args.out_file, "w", encoding="utf-8") as out_f:
         for batch in tqdm(
-            batched(src_lines, args.batch_size),
-            total=(len(src_lines) + args.batch_size - 1) // args.batch_size,
+            batched_iter(iter_lines(args.src_file, lower=args.lower), args.batch_size),
+            total=total_batches,
             desc="Translating",
         ):
             batch_in = [prefix + line for line in batch]
@@ -802,10 +833,16 @@ def translate_hf_seq2seq(args: argparse.Namespace) -> None:
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=True,
             )
-            outputs.extend(texts)
+            texts = [text.strip() for text in texts]
 
-    write_lines(args.out_file, outputs)
-    print(f"Wrote {len(outputs)} translations to {args.out_file}")
+            for text in texts:
+                out_f.write(text + "\n")
+            n_written += len(texts)
+
+            if collect_outputs:
+                outputs.extend(texts)
+
+    print(f"Wrote {n_written} translations to {args.out_file}")
 
     if args.ref_file:
         ref_lines = read_lines(args.ref_file)
