@@ -536,6 +536,18 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
 
     os.makedirs(args.save, exist_ok=True)
 
+    if (
+        os.path.exists(args.save)
+        and os.listdir(args.save)
+        and not args.overwrite_output_dir
+        and args.resume_from_checkpoint is None
+        and not args.auto_resume
+    ):
+        raise ValueError(
+            f"Output directory already exists and is not empty: {args.save}\n"
+            "Use --overwrite-output-dir or --resume-from-checkpoint."
+        )
+
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model, use_fast=True)
     model = AutoModelForSeq2SeqLM.from_pretrained(args.pretrained_model)
 
@@ -1189,7 +1201,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ft.add_argument("--greater-is-better", action="store_true")
     ft.add_argument("--early-stopping-patience", type=int, default=None)
     ft.add_argument("--early-stopping-threshold", type=float, default=0.0)
-    
+    ft.add_argument(
+       "--overwrite-output-dir",
+        action="store_true",
+        help="Allow training in an existing non-empty output directory.",
+    )
     # translate
     tr = sub.add_parser("translate", help="Translate a source file with a model")
     tr.add_argument("--model-type", required=True, choices=sorted(HF_SEQ2SEQ_TYPES))
