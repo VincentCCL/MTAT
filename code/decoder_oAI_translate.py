@@ -364,7 +364,8 @@ def build_argparser():
     key_group.add_argument("--api-key", help="Pass API key directly")
     key_group.add_argument("--api-env", help="Read API key from environment variable")
     key_group.add_argument("--kaggle-secret", help="Read API key from Kaggle secret")
-
+    key_group.add_argument("--api-key-file",  help="Read API key from a text file",
+)
     return ap
 
 
