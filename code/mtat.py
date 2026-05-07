@@ -1054,6 +1054,13 @@ def make_yaml_safe(value):
 
 def serializable_config(args: argparse.Namespace) -> Dict[str, object]:
     config = dict(vars(args))
+    RUNTIME_ONLY_KEYS = {
+        "resolved_resume_from_checkpoint",
+    }
+
+    for key in list(config.keys()):
+        if key in RUNTIME_ONLY_KEYS:
+            del config[key]
 
     config["_metadata"] = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
