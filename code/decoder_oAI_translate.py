@@ -239,6 +239,14 @@ def translate_file(args):
     )
     client = OpenAI(api_key=api_key, base_url=args.base_url)
 
+    if args.model is None:
+        models = client.models.list()
+
+        print("\n=== Available models ===")
+        for m in models.data:
+            print(m.id)
+
+        return
     all_lines = read_lines(args.input)
     output_lines = list(all_lines)
 
@@ -360,7 +368,11 @@ def build_argparser():
     ap.add_argument("--target-lang", required=True, help="Target language, e.g. Dutch")
     ap.add_argument("--source-lang", default=None, help="Source language, e.g. English")
 
-    ap.add_argument("--model", required=True, help="Model id or alias")
+    ap.add_argument(
+       "--model",
+        default=None,
+        help="Model id or alias; if omitted, available models are listed",
+    )
     ap.add_argument("--base-url", default=DEFAULT_BASE_URL, help="API base URL")
     ap.add_argument("--batch-size", type=int, default=1, help="Number of sentences per request")
     ap.add_argument("--temperature", type=float, default=0.0, help="Generation temperature")
