@@ -206,11 +206,15 @@ def read_lines(path: str) -> List[str]:
     with open(path, "r", encoding="utf-8") as f:
         return [line.rstrip("\n") for line in f]
 
-
 def write_lines(path: str, lines: List[str]) -> None:
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
     with open(path, "w", encoding="utf-8") as f:
         for line in lines:
             f.write(line + "\n")
+
 
 def show_batch(batch_no, batch, translations, progress=False, show_n=1):
     n = min(show_n, len(batch), len(translations))
