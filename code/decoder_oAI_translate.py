@@ -351,10 +351,6 @@ def build_argparser():
     ap.add_argument("--show-n", type=int, default=1,
                 help="How many sentence pairs to show per batch when --show-translations is used")
 
-    ap.add_argument(
-        "--api-key-file",
-        help="Read API key from a text file",
-    )
     ap.add_argument("--ref-file", default=None,
                 help="Reference translation file")
 
