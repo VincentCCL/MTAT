@@ -132,8 +132,11 @@ def read_lines(path: str, lower: bool = False) -> List[str]:
         lines = [line.lower() for line in lines]
     return lines
 
-
 def write_lines(path: str, lines: Sequence[str]) -> None:
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
     with open(path, "w", encoding="utf-8") as f:
         for line in lines:
             f.write(line + "\n")
