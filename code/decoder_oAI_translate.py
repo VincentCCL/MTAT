@@ -242,11 +242,29 @@ def translate_file(args):
     all_lines = read_lines(args.input)
     output_lines = list(all_lines)
 
+    if os.path.exists(args.output):
+        previous_lines = read_lines(args.output)
+
+        if len(previous_lines) == len(all_lines):
+            output_lines = previous_lines
+            print(
+                f"[info] resuming from existing output: {args.output}",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(
+                f"[warn] existing output has {len(previous_lines)} lines, "
+                f"input has {len(all_lines)} lines; ignoring previous output",
+                file=sys.stderr,
+                flush=True,
+            )
+    
     nonempty_indices = []
     nonempty_sentences = []
 
     for i, line in enumerate(all_lines):
-        if line.strip():
+        if line.strip() and output_lines[i] == line:
             nonempty_indices.append(i)
             nonempty_sentences.append(line)
 
