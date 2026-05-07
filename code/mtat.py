@@ -853,8 +853,10 @@ def translate_hf_seq2seq(args: argparse.Namespace) -> None:
         raise ValueError(f"Unsupported model type for translation: {args.model_type}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, use_fast=True)
-    model = AutoModelForSeq2SeqLM.from_pretrained(args.model_dir)
-
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        args.model_dir,
+        torch_dtype=torch.float16 if args.fp16 else None,
+    )
     forced_bos_token_id = configure_tokenizer_and_model_for_languages(
         tokenizer=tokenizer,
         model=model,
@@ -1341,6 +1343,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     tr.add_argument("--device", default=None, choices=["cpu", "cuda"])
     tr.add_argument("--ref-file", default=None)
     tr.add_argument("--metrics", default="bleu,chrf,ter")
+    tr.add_argument("--fp16", action="store_true")
 
     return ap
 
