@@ -227,7 +227,12 @@ def show_batch(batch_no, batch, translations, progress=False, show_n=1):
         print(msg, flush=True)
 
 def translate_file(args):
-    api_key = get_api_key(args.api_key, args.api_env, args.kaggle_secret)
+    api_key = get_api_key(
+        api_key=args.api_key,
+        api_env=args.api_env,
+        kaggle_secret=args.kaggle_secret,
+        api_key_file=args.api_key_file,
+    )
     client = OpenAI(api_key=api_key, base_url=args.base_url)
 
     all_lines = read_lines(args.input)
