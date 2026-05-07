@@ -363,9 +363,9 @@ def translate_file(args):
 def build_argparser():
     ap = argparse.ArgumentParser(description="Translate a text file via an OpenAI-compatible endpoint.")
 
-    ap.add_argument("--input", required=True, help="Input text file")
-    ap.add_argument("--output", required=True, help="Output text file")
-    ap.add_argument("--target-lang", required=True, help="Target language, e.g. Dutch")
+    ap.add_argument("--input", help="Input text file")
+    ap.add_argument("--output", help="Output text file")
+    ap.add_argument("--target-lang", help="Target language, e.g. Dutch")
     ap.add_argument("--source-lang", default=None, help="Source language, e.g. English")
 
     ap.add_argument(
@@ -403,10 +403,46 @@ def build_argparser():
 )
     return ap
 
-
 def main():
     ap = build_argparser()
     args = ap.parse_args()
+
+    # Listing mode
+    if args.model is None:
+        api_key = get_api_key(
+            api_key=args.api_key,
+            api_env=args.api_env,
+            kaggle_secret=args.kaggle_secret,
+            api_key_file=args.api_key_file,
+        )
+
+        client = OpenAI(
+            api_key=api_key,
+            base_url=args.base_url,
+        )
+
+        models = client.models.list()
+
+        print("\n=== Available models ===")
+        for m in models.data:
+            print(m.id)
+
+        return
+
+    # Translation mode validation
+    missing = []
+
+    if not args.input:
+        missing.append("--input")
+
+    if not args.output:
+        missing.append("--output")
+
+    if not args.target_lang:
+        missing.append("--target-lang")
+
+    if missing:
+        ap.error("the following arguments are required: " + ", ".join(missing))
 
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1")
