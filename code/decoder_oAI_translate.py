@@ -6,6 +6,8 @@ import os
 import sys
 import time
 from typing import List, Optional
+import sacrebleu
+from sacrebleu.metrics import TER
 
 from openai import OpenAI
 
@@ -59,6 +61,25 @@ def get_api_key(
         "Provide one of: --api-key, --api-env, --api-key-file, or --kaggle-secret"
     )
 
+def compute_metrics(hyps, refs, metrics):
+    requested = {
+        m.strip().lower()
+        for m in metrics.replace(",", " ").split()
+        if m.strip()
+    }
+
+    scores = {}
+
+    if "bleu" in requested:
+        scores["bleu"] = sacrebleu.corpus_bleu(hyps, [refs]).score
+
+    if "chrf" in requested or "chrf++" in requested:
+        scores["chrf"] = sacrebleu.corpus_chrf(hyps, [refs]).score
+
+    if "ter" in requested:
+        scores["ter"] = TER().corpus_score(hyps, [refs]).score
+
+    return scores
 
 def build_prompt(sentences: List[str], src_lang: Optional[str], tgt_lang: str) -> str:
     payload = {"sentences": sentences}
@@ -289,7 +310,20 @@ def translate_file(args):
 
     write_lines(args.output, output_lines)
     print(f"[info] finished, wrote output to {args.output}", file=sys.stderr, flush=True)
+    if args.ref_file:
+        refs = read_lines(args.ref_file)
 
+        if len(refs) != len(output_lines):
+            raise ValueError(
+                f"Reference length mismatch: "
+                f"{len(refs)} refs vs {len(output_lines)} outputs"
+            )
+
+        scores = compute_metrics(output_lines, refs, args.metrics)
+
+        print("\n=== Metrics ===")
+        for name, value in scores.items():
+            print(f"{name}: {value:.2f}")
 
 def build_argparser():
     ap = argparse.ArgumentParser(description="Translate a text file via an OpenAI-compatible endpoint.")
@@ -321,6 +355,11 @@ def build_argparser():
         "--api-key-file",
         help="Read API key from a text file",
     )
+    ap.add_argument("--ref-file", default=None,
+                help="Reference translation file")
+
+    ap.add_argument("--metrics", default="bleu,chrf,ter",
+                help="Comma-separated metrics")
     key_group = ap.add_mutually_exclusive_group(required=True)
     key_group.add_argument("--api-key", help="Pass API key directly")
     key_group.add_argument("--api-env", help="Read API key from environment variable")
