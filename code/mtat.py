@@ -1055,6 +1055,7 @@ def make_yaml_safe(value):
 def serializable_config(args: argparse.Namespace) -> Dict[str, object]:
     config = dict(vars(args))
     RUNTIME_ONLY_KEYS = {
+        "config",
         "resolved_resume_from_checkpoint",
     }
 
