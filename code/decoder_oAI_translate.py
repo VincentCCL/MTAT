@@ -17,11 +17,11 @@ except ImportError:
 
 DEFAULT_BASE_URL = "https://api.helmholtz-blablador.fz-juelich.de/v1/"
 
-
 def get_api_key(
     api_key: Optional[str] = None,
     api_env: Optional[str] = None,
     kaggle_secret: Optional[str] = None,
+    api_key_file: Optional[str] = None,
 ) -> str:
     if api_key:
         return api_key
@@ -31,6 +31,15 @@ def get_api_key(
         if value:
             return value
         raise ValueError(f"Environment variable '{api_env}' is not set")
+
+    if api_key_file:
+        with open(api_key_file, "r", encoding="utf-8") as f:
+            value = f.read().strip()
+
+        if value:
+            return value
+
+        raise ValueError(f"API key file '{api_key_file}' is empty")
 
     if kaggle_secret:
         try:
@@ -46,7 +55,9 @@ def get_api_key(
             return value
         raise ValueError(f"Kaggle secret '{kaggle_secret}' not found or empty")
 
-    raise ValueError("Provide one of: --api-key, --api-env, or --kaggle-secret")
+    raise ValueError(
+        "Provide one of: --api-key, --api-env, --api-key-file, or --kaggle-secret"
+    )
 
 
 def build_prompt(sentences: List[str], src_lang: Optional[str], tgt_lang: str) -> str:
@@ -306,6 +317,10 @@ def build_argparser():
     ap.add_argument("--show-n", type=int, default=1,
                 help="How many sentence pairs to show per batch when --show-translations is used")
 
+    ap.add_argument(
+        "--api-key-file",
+        help="Read API key from a text file",
+    )
     key_group = ap.add_mutually_exclusive_group(required=True)
     key_group.add_argument("--api-key", help="Pass API key directly")
     key_group.add_argument("--api-env", help="Read API key from environment variable")
