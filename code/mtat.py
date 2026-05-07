@@ -883,7 +883,9 @@ def translate_hf_seq2seq(args: argparse.Namespace) -> None:
     collect_outputs = args.ref_file is not None
     outputs: List[str] = []
     n_written = 0
-
+    out_dir = os.path.dirname(args.out_file)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     with torch.inference_mode(), open(args.out_file, "w", encoding="utf-8") as out_f:
         for batch in tqdm(
             batched_iter(iter_lines(args.src_file, lower=args.lower), args.batch_size),
