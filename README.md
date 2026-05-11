@@ -23,7 +23,9 @@ Translation through Python with commercial engines and evaluation with most comm
   * [Bleurt](https://colab.research.google.com/drive/1lHoEoGQM8-Hg6KqCgCbqiwU_RYiO3L8n)
   * [COMET](https://colab.research.google.com/drive/1m65-TU26XJYaXBNRkjlxDd1_oYtAhgLI)
 
-  # Chapter 4. RNN Language Modeling
+# Chapter 4. RNN Language Modeling
+Before we start on MT, we explain RNN language modeling with a toy example and later expand it to a larger language model.
+
   * Github:
     * [Toy LM](https://github.com/VincentCCL/MTAT/blob/main/notebooks/MTAT26_RNN_Language_Model.ipynb)
     * [Larger LM](https://github.com/VincentCCL/MTAT/blob/main/notebooks/MTAT26_RNN_Language_Modeling_Large.ipynb)
@@ -31,4 +33,13 @@ Translation through Python with commercial engines and evaluation with most comm
     * [Toy LM](https://colab.research.google.com/drive/1TITxFBtkRwoejC0vXT9AWZjZc7ms-hJM)
     * [Larger LM](https://colab.research.google.com/drive/1rTZJGbs2SSsDWHmgHXRv5OSfdmePWej1)
 
-https://github.com/VincentCCL/MTAT/blob/main/notebooks/MTAT26_Translation%26Evaluation.ipynb
+# Chapter 5. RNN Machine Translation
+
+* Github:
+  * [Toy example](https://github.com/VincentCCL/MTAT/blob/main/notebooks/MTAT26_RNN_Encoder_Decoder.ipynb)
+  * [Scaling up](https://github.com/VincentCCL/MTAT/blob/main/notebooks/mtat26-chapter5-rnns.ipynb)
+* Colab / Kaggle:
+  * [Toy example](https://colab.research.google.com/drive/1KG8QWkcscaxTU4as5rT1oUzbUYlTpWyQ)
+  * [Scaling up in Kaggle](https://www.kaggle.com/code/vincentvandeghinste/mtat26-chapter5-rnns)
+ 
+  
