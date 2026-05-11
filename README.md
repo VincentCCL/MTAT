@@ -52,3 +52,22 @@ Before we start on MT, we explain RNN language modeling with a toy example and l
   * [Subwording](https://www.kaggle.com/code/vincentvandeghinste/mtat26-subwording)
   * [Transformers](https://www.kaggle.com/code/vincentvandeghinste/mtat26-transformers)
   * [Multilingual Transformers](https://www.kaggle.com/code/vincentvandeghinste/mtat26-multilingualtransformers)     
+
+# Chapter 7. Pretrained Encoder-Decoders
+
+* Github:
+  * [T5](https://github.com/VincentCCL/MTAT/blob/main/notebooks/mtat26-t5.ipynb)
+  * [mT5](https://github.com/VincentCCL/MTAT/blob/main/notebooks/mtat26-mt5.ipynb)
+  * [mBART](https://github.com/VincentCCL/MTAT/blob/main/notebooks/mtat26-mbart.ipynb)
+  * [M2M](https://github.com/VincentCCL/MTAT/blob/main/notebooks/mtat26-m2m.ipynb)
+  * [NLLB](https://github.com/VincentCCL/MTAT/blob/main/notebooks/mtat26-nllb.ipynb)
+  * [Madlad 400](https://github.com/VincentCCL/MTAT/blob/main/notebooks/mtat26-madlad400.ipynb)
+* Kaggle:
+  * [T5](https://www.kaggle.com/code/vincentvandeghinste/mtat26-t5)
+  * [mT5](https://www.kaggle.com/code/vincentvandeghinste/mtat26-mt5)
+  * [mBART](https://www.kaggle.com/code/vincentvandeghinste/mtat26-mbart)
+  * [M2M](https://www.kaggle.com/code/vincentvandeghinste/mtat26-m2m)
+  * [NLLB](https://www.kaggle.com/code/vincentvandeghinste/mtat26-nllb)
+  * [Madlad 400](https://www.kaggle.com/code/vincentvandeghinste/mtat26-madlad400)
+ 
+  
