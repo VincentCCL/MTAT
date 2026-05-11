@@ -42,4 +42,13 @@ Before we start on MT, we explain RNN language modeling with a toy example and l
   * [Toy example](https://colab.research.google.com/drive/1KG8QWkcscaxTU4as5rT1oUzbUYlTpWyQ)
   * [Scaling up in Kaggle](https://www.kaggle.com/code/vincentvandeghinste/mtat26-chapter5-rnns)
  
-  
+# Chapter 6. Subwording and Transformers
+
+* Github:
+  * [Subwording](https://github.com/VincentCCL/MTAT/blob/main/notebooks/mtat26-subwording.ipynb)
+  * [Transformers](https://github.com/VincentCCL/MTAT/blob/main/notebooks/mtat26-transformers.ipynb)
+  * [Multilingual Transformers](https://github.com/VincentCCL/MTAT/blob/main/notebooks/mtat26-multilingualtransformers.ipynb)
+* Kaggle:
+  * [Subwording](https://www.kaggle.com/code/vincentvandeghinste/mtat26-subwording)
+  * [Transformers](https://www.kaggle.com/code/vincentvandeghinste/mtat26-transformers)
+  * [Multilingual Transformers](https://www.kaggle.com/code/vincentvandeghinste/mtat26-multilingualtransformers)     
