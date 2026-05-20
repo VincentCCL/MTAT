@@ -701,8 +701,11 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
         and not args.eval_disabled
         and not args.no_generate
     )
-    should_decode_eval_predictions = args.eval_metrics or args.save_eval_translations or examples_from_eval
-
+    should_decode_eval_predictions = (
+       bool(requested_metrics)
+        or args.save_eval_translations
+        or examples_from_eval
+    )
     if should_decode_eval_predictions:
         if args.no_generate:
             raise ValueError("Validation metrics/translations/examples require generation; remove --no-generate.")
@@ -729,6 +732,16 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
 
     eval_batch_size = args.eval_batch_size if args.eval_batch_size is not None else args.batch_size
 
+    if (
+        args.metric_for_best_model != "eval_loss"
+        and not requested_metrics
+    ):
+        raise ValueError(
+            "metric_for_best_model requires evaluation metrics. "
+            "Enable metrics with --eval-metrics "
+            "or use --metric-for-best-model eval_loss"
+        )
+    
     training_args = build_training_arguments(
         output_dir=args.save,
         num_train_epochs=args.epochs,
