@@ -18,6 +18,23 @@ except ImportError:
 
 
 DEFAULT_BASE_URL = "https://api.helmholtz-blablador.fz-juelich.de/v1/"
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a professional machine translation system. "
+    "Preserve meaning, tone, formatting, and sentence boundaries. "
+    "Return only valid JSON."
+)
+
+DEFAULT_USER_PROMPT_TEMPLATE = """
+Translate the following sentences{src_part} to {tgt_lang}.
+
+Return ONLY valid JSON with exactly one key: "translations".
+Its value must be a list of translated strings in exactly the same order
+and with exactly the same length as the input.
+
+Input JSON:
+{payload}
+""".strip()
+
 
 def get_api_key(
     api_key: Optional[str] = None,
@@ -395,6 +412,8 @@ def build_argparser():
 
     ap.add_argument("--metrics", default="bleu,chrf,ter",
                 help="Comma-separated metrics")
+    ap.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT, help="Ovverride system prompt")
+    ap.add_argument("--prompt-template", default=DEFAULT_USER_PROMPT_TEMPLATE)  
     key_group = ap.add_mutually_exclusive_group(required=True)
     key_group.add_argument("--api-key", help="Pass API key directly")
     key_group.add_argument("--api-env", help="Read API key from environment variable")
