@@ -329,18 +329,26 @@ def build_compute_metrics_fn(
         eval_counter["n"] += 1
 
         preds, labels = eval_pred
-
         if isinstance(preds, tuple):
             preds = preds[0]
 
+        # Some Transformers/model combinations may return logits instead of token ids.
+        # Convert logits to ids if needed.
+        if preds.ndim == 3:
+            preds = np.argmax(preds, axis=-1)
+
+        # Replace ignore indices.
+        preds = np.where(preds != -100, preds, tokenizer.pad_token_id)
         labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
 
-        pred_str = tokenizer.batch_decode(preds, skip_special_tokens=True)
-        ref_str = tokenizer.batch_decode(labels, skip_special_tokens=True)
+        # Protect the fast tokenizer from invalid ids.
+        vocab_size = len(tokenizer)
+        preds = np.where((preds >= 0) & (preds < vocab_size), preds, tokenizer.pad_token_id)
+        labels = np.where((labels >= 0) & (labels < vocab_size), labels, tokenizer.pad_token_id)
 
-        pred_str = [x.strip() for x in pred_str]
-        ref_str = [x.strip() for x in ref_str]
-
+        pred_str = tokenizer.batch_decode(preds.astype(np.int64), skip_special_tokens=True)
+        ref_str = tokenizer.batch_decode(labels.astype(np.int64), skip_special_tokens=True)
+        
         metrics = compute_sacrebleu_metrics(pred_str, ref_str, requested)
 
         if show_example_indices:
