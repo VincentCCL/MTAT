@@ -117,8 +117,12 @@ except Exception:
     sacrebleu = None
     TER = None
 
+from openai import OpenAI
+import time
+
 
 HF_SEQ2SEQ_TYPES = {"t5", "mbart", "m2m", "nllb", "madlad"}
+TRANSLATE_MODEL_TYPES = HF_SEQ2SEQ_TYPES | {"openai"}
 
 
 # ---------------------------------------------------------------------
@@ -193,6 +197,22 @@ def parse_metrics(metrics: str) -> Set[str]:
         if metric.strip()
     }
 
+def get_api_key(
+        api_key:Optional[str]=None,
+        api_env:Optional[str]=None,
+        api_key_file:Optional[str]=None,
+    ) -> str:
+    if api_key:
+        return api_key
+    if api_env:
+        value=os.environ.get(api_env)
+    if api_key_file:
+        with open(api_key_file,"r",encoding="utf-8") as f:
+            value=f.read().strip()
+        if value:
+            return value
+        raise ValueError(f"API key file '{api_key_file}' is empty")
+    raise ValueError("Provide one of: --api-key, --api-env, or --api-key-file")
 
 # ---------------------------------------------------------------------
 # Dataset
@@ -978,7 +998,163 @@ def translate_hf_seq2seq(args: argparse.Namespace) -> None:
                 print(f"{name}: {score:.2f}")
 
 
+def build_openai_prompt(batch: Sequence[str], source_lang: Optional[str], target_lang: str) -> str:
+    payload = {"sentences": list(batch)}
 
+    if source_lang:
+        instruction = f"Translate the following sentences from {source_lang} to {target_lang}. "
+    else:
+        instruction = f"Translate the following sentences to {target_lang}. "
+
+    instruction += (
+        "Return ONLY valid JSON with exactly one key: 'translations'. "
+        "Its value must be a list of translated strings in exactly the same order "
+        "and with exactly the same length as the input. "
+        "Do not add explanations, comments, markdown, or extra text."
+    )
+
+    return instruction + "\n\nInput JSON:\n" + json.dumps(payload, ensure_ascii=False)
+
+
+def parse_openai_translation_output(text: str, expected_n: int) -> List[str]:
+    data = json.loads(text)
+
+    if not isinstance(data, dict) or "translations" not in data:
+        raise ValueError("Model output does not contain a 'translations' key")
+
+    translations = data["translations"]
+
+    if not isinstance(translations, list):
+        raise ValueError("'translations' is not a list")
+
+    if len(translations) != expected_n:
+        raise ValueError(
+            f"Translation length mismatch: expected {expected_n}, got {len(translations)}"
+        )
+
+    return [str(item).strip() for item in translations]
+
+
+def translate_openai_batch(
+    client: OpenAI,
+    batch: Sequence[str],
+    model: str,
+    source_lang: Optional[str],
+    target_lang: str,
+    temperature: float,
+    timeout: float,
+    max_retries: int,
+    retry_wait: float,
+    debug: bool = False,
+) -> List[str]:
+    prompt = build_openai_prompt(batch, source_lang, target_lang)
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                temperature=temperature,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a machine translation system. "
+                            "Follow the requested output format exactly."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                timeout=timeout,
+            )
+
+            text = response.choices[0].message.content
+            if text is None:
+                raise ValueError("Empty response content")
+
+            if debug:
+                preview = text[:500].replace("\n", "\\n")
+                print(f"[debug] raw response: {preview}", file=sys.stderr, flush=True)
+
+            return parse_openai_translation_output(text, len(batch))
+
+        except Exception as e:
+            last_error = e
+            if attempt == max_retries - 1:
+                break
+
+            wait = retry_wait * (2 ** attempt)
+            print(
+                f"[warn] batch failed (attempt {attempt + 1}/{max_retries}): {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            print(f"[warn] retrying in {wait:.1f}s", file=sys.stderr, flush=True)
+            time.sleep(wait)
+
+    raise RuntimeError(f"Batch failed after {max_retries} attempts: {last_error}")
+
+
+def translate_openai(args: argparse.Namespace) -> None:
+    api_key = get_api_key(
+        api_key=args.api_key,
+        api_env=args.api_env,
+        api_key_file=args.api_key_file,
+    )
+
+    client = OpenAI(api_key=api_key, base_url=args.base_url)
+
+    total_lines = count_lines(args.src_file)
+    total_batches = (total_lines + args.batch_size - 1) // args.batch_size
+
+    out_dir = os.path.dirname(args.out_file)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    outputs: List[str] = []
+    n_written = 0
+
+    with open(args.out_file, "w", encoding="utf-8") as out_f:
+        for batch in tqdm(
+            batched_iter(iter_lines(args.src_file, lower=args.lower), args.batch_size),
+            total=total_batches,
+            desc="Translating",
+        ):
+            translations = translate_openai_batch(
+                client=client,
+                batch=batch,
+                model=args.model,
+                source_lang=args.source_lang,
+                target_lang=args.target_lang,
+                temperature=args.temperature,
+                timeout=args.timeout,
+                max_retries=args.max_retries,
+                retry_wait=args.retry_wait,
+                debug=args.debug,
+            )
+
+            for hyp in translations:
+                out_f.write(hyp + "\n")
+                outputs.append(hyp)
+
+            out_f.flush()
+            n_written += len(translations)
+
+    print(f"Wrote {n_written} translations to {args.out_file}")
+
+    if args.ref_file:
+        refs = read_lines(args.ref_file)
+
+        if len(refs) != len(outputs):
+            raise ValueError(
+                f"Line count mismatch: {len(outputs)} system outputs vs {len(refs)} references."
+            )
+
+        requested_metrics = parse_metrics(args.metrics)
+        if requested_metrics:
+            scores = compute_sacrebleu_metrics(outputs, refs, requested_metrics)
+            for name, score in scores.items():
+                print(f"{name}: {score:.2f}")
 
 # ---------------------------------------------------------------------
 # Checkpoint / continuation helpers
@@ -1373,8 +1549,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     # translate
     tr = sub.add_parser("translate", help="Translate a source file with a model")
-    tr.add_argument("--model-type", required=True, choices=sorted(HF_SEQ2SEQ_TYPES))
-    tr.add_argument("--model-dir", required=True)
+    tr.add_argument("--model-type", required=True, choices=sorted(TRANSLATE_MODEL_TYPES))
+    tr.add_argument("--model-dir", default=None, help="HF model directory (required for local models, not for --model-type openai)",)
     add_common_data_args(tr)
     tr.add_argument("--out-file", required=True)
     add_language_args(tr)
@@ -1389,6 +1565,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable generation cache; slower, but avoids cache-related warnings.",
     )
+    tr.add_argument("--model", default=None, help="OpenAI-compatible model name")
+    tr.add_argument("--base-url", default="https://api.helmholtz-blablador.fz-juelich.de/v1/")
+    tr.add_argument("--api-key", default=None)
+    tr.add_argument("--api-env", default=None)
+    tr.add_argument("--api-key-file", default=None)
+    tr.add_argument("--source-lang", default=None, help="Source language name, e.g. French")
+    tr.add_argument("--target-lang", default=None, help="Target language name, e.g. Dutch")
+    tr.add_argument("--temperature", type=float, default=0.0)
+    tr.add_argument("--timeout", type=float, default=60.0)
+    tr.add_argument("--max-retries", type=int, default=5)
+    tr.add_argument("--retry-wait", type=float, default=2.0)
+    tr.add_argument("--debug", action="store_true")
     return ap
 
 
@@ -1399,7 +1587,17 @@ def main() -> None:
     if args.command == "finetune":
         finetune_hf_seq2seq(args)
     elif args.command == "translate":
-        translate_hf_seq2seq(args)
+        if args.model_type == "openai":
+            if not args.model:
+                raise ValueError("--model is required when --model-type openai")
+            if not args.target_lang:
+                raise ValueError("--target-lang is required when --model-type openai")
+            translate_openai(args)
+        else:
+            if not args.model_dir:
+                raise ValueError("--model-dir is required for moddel types "
+                                 "t5, mbart, m2m, nllb and madlad")
+            translate_hf_seq2seq(args)
     else:
         raise ValueError(f"Unsupported command: {args.command}")
 
