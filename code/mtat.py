@@ -254,7 +254,19 @@ def iter_lines(path: str, lower: bool = False) -> Iterable[str]:
             text = line.rstrip("\n")
             yield text.lower() if lower else text
 
+def disable_generation_cache(model) -> None:
+    """
+    Avoid deprecated tuple-based past_key_values cache warnings during training.
 
+    Training does not need generation cache. Keeping it disabled is also required
+    when gradient checkpointing is active.
+    """
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+
+    if hasattr(model, "generation_config") and model.generation_config is not None:
+        model.generation_config.use_cache = False
+            
 def build_training_arguments(**kwargs) -> Seq2SeqTrainingArguments:
     """
     Create Seq2SeqTrainingArguments across Transformers versions.
@@ -668,9 +680,11 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
         tgt_lang=args.tgt_lang,
     )
 
+    disable_generation_cache(model)
+
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
-        model.config.use_cache = False
+    
 
     prefix = "" if args.no_prefix else args.prefix
 
@@ -870,6 +884,9 @@ def translate_hf_seq2seq(args: argparse.Namespace) -> None:
         args.model_dir,
         torch_dtype=torch.float16 if args.fp16 else None,
     )
+    if args.no_cache:
+        disable_generation_cache(model)
+
     forced_bos_token_id = configure_tokenizer_and_model_for_languages(
         tokenizer=tokenizer,
         model=model,
@@ -1359,7 +1376,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     tr.add_argument("--ref-file", default=None)
     tr.add_argument("--metrics", default="bleu,chrf,ter")
     tr.add_argument("--fp16", action="store_true")
-
+    tr.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable generation cache; slower, but avoids cache-related warnings.",
+    )
     return ap
 
 
