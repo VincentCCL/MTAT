@@ -110,6 +110,21 @@ from transformers import (
     EarlyStoppingCallback
 )
 
+
+try:
+    from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+except Exception:
+    LoraConfig = None
+    TaskType = None
+    get_peft_model = None
+    prepare_model_for_kbit_training = None
+
+try:
+    from transformers import BitsAndBytesConfig
+except Exception:
+    BitsAndBytesConfig = None
+
+    
 try:
     import sacrebleu
     from sacrebleu.metrics import TER
@@ -458,7 +473,28 @@ def configure_tokenizer_and_model_for_languages(
 
     return forced_bos_token_id
 
+def enable_gradient_checkpointing_safely(model) -> None:
+    """
+    LoRA/PEFT + frozen base models can fail with default reentrant
+    gradient checkpointing because no input requires grad.
 
+    use_reentrant=False avoids the detached-loss issue.
+    """
+    if hasattr(model, "gradient_checkpointing_enable"):
+        try:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:
+            model.gradient_checkpointing_enable()
+
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    else:
+        def make_inputs_require_grad(module, input, output):
+            output.requires_grad_(True)
+
+        model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 # ---------------------------------------------------------------------
 # Validation examples
 # ---------------------------------------------------------------------
@@ -698,8 +734,28 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
         )
 
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model, use_fast=True)
-    model = AutoModelForSeq2SeqLM.from_pretrained(args.pretrained_model)
 
+    quantization_config = None
+
+    if args.qlora:
+        if BitsAndBytesConfig is None:
+            raise RuntimeError("QLoRA requires bitsandbytes/transformers BitsAndBytesConfig.")
+
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        args.pretrained_model,
+        torch_dtype=torch.float16 if args.fp16 or args.qlora else None,
+        quantization_config=quantization_config,
+        device_map="auto" if args.qlora else None,
+    )
+
+    
     configure_tokenizer_and_model_for_languages(
         tokenizer=tokenizer,
         model=model,
@@ -708,10 +764,44 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
         tgt_lang=args.tgt_lang,
     )
 
+    if args.lora or args.qlora:
+        if LoraConfig is None or get_peft_model is None:
+            raise RuntimeError("LoRA/QLoRA requires PEFT. Install with: pip install peft")
+
+        if args.qlora:
+            if prepare_model_for_kbit_training is None:
+                raise RuntimeError("QLoRA requires prepare_model_for_kbit_training from PEFT.")
+            model = prepare_model_for_kbit_training(model)
+
+        target_modules = [
+            x.strip()
+            for x in args.lora_target_modules.split(",")
+            if x.strip()
+        ]
+
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type=TaskType.SEQ_2_SEQ_LM,
+            target_modules=target_modules,
+        )
+
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+   
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if trainable == 0:
+            raise RuntimeError(
+                "LoRA/QLoRA created zero trainable parameters. "
+                "Check --lora-target-modules."
+            )
+                
     disable_generation_cache(model)
 
     if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        enable_gradient_checkpointing_safely(model)
     
 
     prefix = "" if args.no_prefix else args.prefix
@@ -809,6 +899,8 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
         metric_for_best_model=args.metric_for_best_model,
         greater_is_better=args.greater_is_better,
         save_only_model=args.save_only_model,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        label_names=['labels']
     )
 
     trainer = Seq2SeqTrainer(
@@ -1547,6 +1639,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow training in an existing non-empty output directory.",
     )
+    ft.add_argument("--lora", action="store_true")
+    ft.add_argument("--qlora", action="store_true")
+    ft.add_argument("--lora-r", type=int, default=16)
+    ft.add_argument("--lora-alpha", type=int, default=32)
+    ft.add_argument("--lora-dropout", type=float, default=0.05)
+    ft.add_argument(
+        "--lora-target-modules",
+        default="q,v",
+        help="Comma-separated module names, e.g. q,v or q,k,v,o",
+    )
+    
     # translate
     tr = sub.add_parser("translate", help="Translate a source file with a model")
     tr.add_argument("--model-type", required=True, choices=sorted(TRANSLATE_MODEL_TYPES))
