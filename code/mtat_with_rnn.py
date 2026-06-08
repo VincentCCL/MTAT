@@ -1668,47 +1668,33 @@ def set_rnn_seed(seed: int) -> None:
 def count_trainable_parameters(model: nn.Module) -> int:
     return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
 
-
-def compute_rnn_loss(
-    model: Seq2SeqRNN,
-    batch: Tuple[torch.Tensor, torch.Tensor],
-    criterion: nn.Module,
-    device: torch.device,
-    teacher_forcing: float,
-) -> torch.Tensor:
+def compute_rnn_loss(model, batch, criterion, device, teacher_forcing):
     src, tgt = batch
     src = src.to(device)
     tgt = tgt.to(device)
-    decoder_inputs = tgt[:, :-1]
-    gold = tgt[:, 1:].contiguous()
-    logits = model(src, decoder_inputs, teacher_forcing_ratio=teacher_forcing)
-    return criterion(logits.view(-1, logits.size(-1)), gold.view(-1))
+
+    logits = model(src, tgt, teacher_forcing_ratio=teacher_forcing)
+    return criterion(logits.reshape(-1, logits.size(-1)), tgt.reshape(-1))
 
 
-def evaluate_rnn_nll(
-    model: Seq2SeqRNN,
-    data_loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-    pad_idx: int,
-) -> float:
-    """Compute validation negative log likelihood without teacher forcing."""
+def evaluate_rnn_nll(model, data_loader, criterion, device, pad_idx):
     model.eval()
     total_loss = 0.0
     total_tokens = 0
+
     with torch.no_grad():
         for src, tgt in data_loader:
             src = src.to(device)
             tgt = tgt.to(device)
-            decoder_inputs = tgt[:, :-1]
-            gold = tgt[:, 1:].contiguous()
-            logits = model(src, decoder_inputs, teacher_forcing_ratio=0.0)
-            loss = criterion(logits.view(-1, logits.size(-1)), gold.view(-1))
-            num_tokens = (gold != pad_idx).sum().item()
+
+            logits = model(src, tgt, teacher_forcing_ratio=1.0)
+            loss = criterion(logits.reshape(-1, logits.size(-1)), tgt.reshape(-1))
+
+            num_tokens = (tgt != pad_idx).sum().item()
             total_loss += loss.item() * num_tokens
             total_tokens += num_tokens
-    return total_loss / max(total_tokens, 1)
 
+    return total_loss / max(total_tokens, 1)
 
 def simple_detok(text: str) -> str:
     """Tiny detokeniser used by the original RNN script before sacreBLEU."""
