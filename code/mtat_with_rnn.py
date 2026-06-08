@@ -1037,23 +1037,45 @@ def build_openai_prompt(batch: Sequence[str], source_lang: Optional[str], target
 
 
 def parse_openai_translation_output(text: str, expected_n: int) -> List[str]:
-    """Validate and extract the translations list from the model response."""
-    data = json.loads(text)
+    raw = text.strip()
 
-    if not isinstance(data, dict) or "translations" not in data:
-        raise ValueError("Model output does not contain a 'translations' key")
+    # Remove markdown fences if present
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
 
-    translations = data["translations"]
+    # Try direct JSON first
+    candidates = [raw]
 
-    if not isinstance(translations, list):
-        raise ValueError("'translations' is not a list")
+    # Try extracting the outermost JSON object
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(raw[start:end + 1])
 
-    if len(translations) != expected_n:
-        raise ValueError(
-            f"Translation length mismatch: expected {expected_n}, got {len(translations)}"
-        )
+    last_error = None
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+            translations = data.get("translations")
 
-    return [str(item).strip() for item in translations]
+            if isinstance(translations, list) and len(translations) == expected_n:
+                return [str(item).strip() for item in translations]
+        except Exception as e:
+            last_error = e
+
+    # Fallback: accept plain line-per-translation output
+    lines = [
+        line.strip().lstrip("-0123456789. )")
+        for line in raw.splitlines()
+        if line.strip()
+    ]
+    if len(lines) == expected_n:
+        return lines
+
+    raise ValueError(
+        f"Could not parse model output as {expected_n} translations. "
+        f"Last JSON error: {last_error}. Raw output preview: {raw[:500]!r}"
+    )
 
 
 def translate_openai_batch(
