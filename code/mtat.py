@@ -70,9 +70,10 @@ except Exception:
     yaml = None
 
 try:
-    from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+    from peft import LoraConfig, PeftModel, TaskType, get_peft_model, prepare_model_for_kbit_training
 except Exception:
     LoraConfig = None
+    PeftModel = None
     TaskType = None
     get_peft_model = None
     prepare_model_for_kbit_training = None
@@ -909,16 +910,96 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
 # Hugging Face translation
 # -----------------------------------------------------------------------------
 
+def is_peft_adapter_dir(path: Optional[str]) -> bool:
+    """Return True if path looks like a PEFT/LoRA adapter directory."""
+    return bool(path) and os.path.isdir(path) and os.path.exists(os.path.join(path, "adapter_config.json"))
+
+
+def find_config_yaml_for_model_dir(model_dir: str) -> Optional[str]:
+    """Find config.yaml in model_dir or its parent run directory."""
+    candidates = [
+        os.path.join(model_dir, "config.yaml"),
+        os.path.join(os.path.dirname(os.path.normpath(model_dir)), "config.yaml"),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def infer_base_model_for_adapter(adapter_dir: str, explicit_base_model: Optional[str] = None) -> str:
+    """Resolve the base HF model for a LoRA adapter directory."""
+    if explicit_base_model:
+        return explicit_base_model
+
+    config_path = find_config_yaml_for_model_dir(adapter_dir)
+    if config_path and yaml is not None:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        pretrained_model = data.get("pretrained_model")
+        if pretrained_model:
+            print(f"Inferred base model from {config_path}: {pretrained_model}")
+            return str(pretrained_model)
+
+    adapter_config_path = os.path.join(adapter_dir, "adapter_config.json")
+    if os.path.exists(adapter_config_path):
+        with open(adapter_config_path, "r", encoding="utf-8") as f:
+            adapter_config = json.load(f)
+        base_model_name = adapter_config.get("base_model_name_or_path")
+        if base_model_name:
+            print(f"Inferred base model from {adapter_config_path}: {base_model_name}")
+            return str(base_model_name)
+
+    raise ValueError(
+        f"{adapter_dir} looks like a LoRA/PEFT adapter directory, but the base model "
+        "could not be inferred. Pass it explicitly with --base-model, e.g. "
+        "--base-model facebook/nllb-200-1.3B"
+    )
+
+
+def load_tokenizer_for_hf_translation(model_dir: str, base_model: Optional[str] = None):
+    """Load tokenizer from adapter/checkpoint directory, falling back to base model."""
+    try:
+        return AutoTokenizer.from_pretrained(model_dir, use_fast=True)
+    except Exception as first_error:
+        if not base_model:
+            raise
+        print(
+            f"Could not load tokenizer from {model_dir}; falling back to {base_model}. "
+            f"Original error: {first_error}"
+        )
+        return AutoTokenizer.from_pretrained(base_model, use_fast=True)
+
+
 def translate_hf_seq2seq(args: argparse.Namespace) -> None:
-    """Translate a source file with a local Hugging Face seq2seq model."""
+    """Translate a source file with a local Hugging Face seq2seq model or LoRA adapter."""
     if args.model_type not in HF_SEQ2SEQ_TYPES:
         raise ValueError(f"Unsupported model type for translation: {args.model_type}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_dir, use_fast=True)
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        args.model_dir,
-        torch_dtype=torch.float16 if args.fp16 else None,
-    )
+    torch_dtype = torch.float16 if args.fp16 else None
+
+    if is_peft_adapter_dir(args.model_dir):
+        if PeftModel is None:
+            raise RuntimeError("Loading LoRA/PEFT adapters for translation requires PEFT: pip install peft")
+
+        base_model_name = infer_base_model_for_adapter(args.model_dir, args.base_model)
+        tokenizer = load_tokenizer_for_hf_translation(args.model_dir, base_model_name)
+        base_model = AutoModelForSeq2SeqLM.from_pretrained(
+            base_model_name,
+            torch_dtype=torch_dtype,
+        )
+        model = PeftModel.from_pretrained(base_model, args.model_dir)
+        if args.merge_lora:
+            model = model.merge_and_unload()
+            print("Merged LoRA adapter into the base model for inference.")
+        else:
+            print(f"Loaded LoRA adapter from {args.model_dir} on top of {base_model_name}")
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_dir, use_fast=True)
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            args.model_dir,
+            torch_dtype=torch_dtype,
+        )
 
     if args.no_cache:
         disable_generation_cache(model)
@@ -3336,7 +3417,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     tr.add_argument(
         "--model-dir",
         default=None,
-        help="HF model directory (required for local models, not for --model-type openai)",
+        help="HF model directory or LoRA/PEFT adapter directory (required for local models, not for --model-type openai)",
+    )
+    tr.add_argument(
+        "--base-model",
+        default=None,
+        help=(
+            "Base HF model to use when --model-dir points to a LoRA/PEFT adapter. "
+            "If omitted, the script tries config.yaml and adapter_config.json."
+        ),
+    )
+    tr.add_argument(
+        "--merge-lora",
+        action="store_true",
+        help="Merge a LoRA adapter into the base model before inference.",
     )
     add_common_data_args(tr)
     tr.add_argument("--out-file", required=True)
