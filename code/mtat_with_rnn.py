@@ -105,8 +105,9 @@ except Exception:
 # OpenAI-compatible API backend.
 HF_SEQ2SEQ_TYPES = {"t5", "mbart", "m2m", "nllb", "madlad"}
 RNN_SEQ2SEQ_TYPES = {"rnn"}
-FINETUNE_MODEL_TYPES = HF_SEQ2SEQ_TYPES | RNN_SEQ2SEQ_TYPES
-TRANSLATE_MODEL_TYPES = HF_SEQ2SEQ_TYPES | RNN_SEQ2SEQ_TYPES | {"openai"}
+SCRATCH_TRANSFORMER_TYPES = {"transformer-scratch"}
+FINETUNE_MODEL_TYPES = HF_SEQ2SEQ_TYPES | RNN_SEQ2SEQ_TYPES | SCRATCH_TRANSFORMER_TYPES
+TRANSLATE_MODEL_TYPES = HF_SEQ2SEQ_TYPES | RNN_SEQ2SEQ_TYPES | SCRATCH_TRANSFORMER_TYPES | {"openai"}
 
 
 # -----------------------------------------------------------------------------
@@ -1138,23 +1139,45 @@ def build_openai_prompt(batch: Sequence[str], source_lang: Optional[str], target
 
 
 def parse_openai_translation_output(text: str, expected_n: int) -> List[str]:
-    """Validate and extract the translations list from the model response."""
-    data = json.loads(text)
+    raw = text.strip()
 
-    if not isinstance(data, dict) or "translations" not in data:
-        raise ValueError("Model output does not contain a 'translations' key")
+    # Remove markdown fences if present
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
 
-    translations = data["translations"]
+    # Try direct JSON first
+    candidates = [raw]
 
-    if not isinstance(translations, list):
-        raise ValueError("'translations' is not a list")
+    # Try extracting the outermost JSON object
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(raw[start:end + 1])
 
-    if len(translations) != expected_n:
-        raise ValueError(
-            f"Translation length mismatch: expected {expected_n}, got {len(translations)}"
-        )
+    last_error = None
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+            translations = data.get("translations")
 
-    return [str(item).strip() for item in translations]
+            if isinstance(translations, list) and len(translations) == expected_n:
+                return [str(item).strip() for item in translations]
+        except Exception as e:
+            last_error = e
+
+    # Fallback: accept plain line-per-translation output
+    lines = [
+        line.strip().lstrip("-0123456789. )")
+        for line in raw.splitlines()
+        if line.strip()
+    ]
+    if len(lines) == expected_n:
+        return lines
+
+    raise ValueError(
+        f"Could not parse model output as {expected_n} translations. "
+        f"Last JSON error: {last_error}. Raw output preview: {raw[:500]!r}"
+    )
 
 
 def translate_openai_batch(
@@ -1682,6 +1705,75 @@ class Seq2SeqRNN(nn.Module):
         attn_matrix = torch.stack(attn_list, dim=0) if attn_list else None
         return hyp_ids, attn_matrix
 
+    @torch.no_grad()
+    def greedy_decode_batch(
+        self,
+        src: torch.Tensor,
+        max_len: Optional[int] = None,
+    ) -> Tuple[List[List[int]], List[Optional[torch.Tensor]]]:
+        """
+        Greedy decoding for a padded mini-batch.
+
+        The original RNN implementation decoded validation/test sentences one by
+        one.  That made BLEU validation very slow, because each sentence ran a
+        separate encoder pass.  This method encodes a whole batch once, then
+        performs the autoregressive decoder loop for all active sentences in
+        parallel.
+
+        Returns one list of hypothesis ids per batch item, plus one optional
+        attention matrix per item for --replace-unk.
+        """
+        self.eval()
+        max_len = max_len or self.max_len
+        batch_size = src.size(0)
+        encoder_outputs, enc_hidden = self.encoder(src)
+        src_mask = self.make_src_mask(src)
+
+        dec_input = torch.full(
+            (batch_size,),
+            self.tgt_sos_idx,
+            dtype=torch.long,
+            device=src.device,
+        )
+        dec_hidden = enc_hidden
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=src.device)
+        hyp_ids: List[List[int]] = [[] for _ in range(batch_size)]
+        attn_steps: List[torch.Tensor] = []
+
+        for _ in range(max_len):
+            logits, dec_hidden, attn_weights = self.decoder(
+                dec_input,
+                dec_hidden,
+                encoder_outputs=encoder_outputs,
+                src_mask=src_mask,
+                return_attn=True,
+            )
+            next_token = logits.argmax(-1)
+
+            if attn_weights is not None:
+                attn_steps.append(attn_weights.detach().cpu())
+
+            for i, token in enumerate(next_token.tolist()):
+                if finished[i]:
+                    continue
+                if token == self.tgt_eos_idx:
+                    finished[i] = True
+                else:
+                    hyp_ids[i].append(token)
+
+            dec_input = next_token
+            if bool(finished.all()):
+                break
+
+        attn_matrices: List[Optional[torch.Tensor]] = [None for _ in range(batch_size)]
+        if attn_steps:
+            # [steps, batch, src_len] -> one [tgt_len, src_len] matrix per item.
+            stacked = torch.stack(attn_steps, dim=0)
+            for i in range(batch_size):
+                attn_matrices[i] = stacked[: len(hyp_ids[i]), i, :]
+
+        return hyp_ids, attn_matrices
+
 
 def set_rnn_seed(seed: int) -> None:
     """Set random seeds for the custom PyTorch RNN path."""
@@ -1700,47 +1792,33 @@ def set_rnn_seed(seed: int) -> None:
 def count_trainable_parameters(model: nn.Module) -> int:
     return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
 
-
-def compute_rnn_loss(
-    model: Seq2SeqRNN,
-    batch: Tuple[torch.Tensor, torch.Tensor],
-    criterion: nn.Module,
-    device: torch.device,
-    teacher_forcing: float,
-) -> torch.Tensor:
+def compute_rnn_loss(model, batch, criterion, device, teacher_forcing):
     src, tgt = batch
     src = src.to(device)
     tgt = tgt.to(device)
-    decoder_inputs = tgt[:, :-1]
-    gold = tgt[:, 1:].contiguous()
-    logits = model(src, decoder_inputs, teacher_forcing_ratio=teacher_forcing)
-    return criterion(logits.view(-1, logits.size(-1)), gold.view(-1))
+
+    logits = model(src, tgt, teacher_forcing_ratio=teacher_forcing)
+    return criterion(logits.reshape(-1, logits.size(-1)), tgt.reshape(-1))
 
 
-def evaluate_rnn_nll(
-    model: Seq2SeqRNN,
-    data_loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-    pad_idx: int,
-) -> float:
-    """Compute validation negative log likelihood without teacher forcing."""
+def evaluate_rnn_nll(model, data_loader, criterion, device, pad_idx):
     model.eval()
     total_loss = 0.0
     total_tokens = 0
+
     with torch.no_grad():
         for src, tgt in data_loader:
             src = src.to(device)
             tgt = tgt.to(device)
-            decoder_inputs = tgt[:, :-1]
-            gold = tgt[:, 1:].contiguous()
-            logits = model(src, decoder_inputs, teacher_forcing_ratio=0.0)
-            loss = criterion(logits.view(-1, logits.size(-1)), gold.view(-1))
-            num_tokens = (gold != pad_idx).sum().item()
+
+            logits = model(src, tgt, teacher_forcing_ratio=1.0)
+            loss = criterion(logits.reshape(-1, logits.size(-1)), tgt.reshape(-1))
+
+            num_tokens = (tgt != pad_idx).sum().item()
             total_loss += loss.item() * num_tokens
             total_tokens += num_tokens
-    return total_loss / max(total_tokens, 1)
 
+    return total_loss / max(total_tokens, 1)
 
 def simple_detok(text: str) -> str:
     """Tiny detokeniser used by the original RNN script before sacreBLEU."""
@@ -1804,7 +1882,7 @@ def load_sentencepiece_processors(args_or_model_args) -> Tuple[str, Optional[obj
     if spm is None:
         raise ImportError("sentencepiece is required when --subword-type is not 'none'.")
     if not src_sp_model or not tgt_sp_model:
-        raise ValueError("RNN subword mode requires --src-sp-model and --tgt-sp-model.")
+        raise ValueError("Subword mode requires --src-sp-model and --tgt-sp-model.")
 
     src_sp = spm.SentencePieceProcessor()
     src_sp.load(src_sp_model)
@@ -1951,21 +2029,44 @@ def translate_rnn_lines_from_model(
     subword_type: str = "none",
     src_sp: Optional["spm.SentencePieceProcessor"] = None,
     tgt_sp: Optional["spm.SentencePieceProcessor"] = None,
+    batch_size: int = 32,
 ) -> List[str]:
-    """Translate a list of source strings with a trained RNN checkpoint."""
+    """Translate source strings with a trained RNN checkpoint in batches."""
     hyps: List[str] = []
     model.eval()
-    for src_sentence in tqdm(src_lines, desc="Translating"):
-        model_src = " ".join(src_sp.encode(src_sentence, out_type=str)) if src_sp is not None and subword_type != "none" else src_sentence
-        src_ids = src_vocab.encode(model_src, add_eos=True)
-        src_tensor = torch.tensor(src_ids, dtype=torch.long, device=device).unsqueeze(0)
-        hyp_ids, attn_matrix = model.greedy_decode(src_tensor, max_len=max_len)
-        if replace_unk:
-            tokenised_hyp = replace_unk_with_attention(hyp_ids, attn_matrix, model_src, tgt_vocab)
-        else:
-            tokenised_hyp = tgt_vocab.decode(hyp_ids)
-        hyp = tgt_sp.decode(tokenised_hyp.split()) if tgt_sp is not None and subword_type != "none" else tokenised_hyp
-        hyps.append(hyp)
+    batch_size = max(1, int(batch_size))
+
+    for start in tqdm(
+            range(0, len(src_lines), batch_size),
+            desc="Translating",
+            leave=False,
+    ):
+        batch = src_lines[start:start + batch_size]
+
+        model_src_batch = [
+            " ".join(src_sp.encode(src_sentence, out_type=str))
+            if src_sp is not None and subword_type != "none"
+            else src_sentence
+            for src_sentence in batch
+        ]
+        encoded = [src_vocab.encode(model_src, add_eos=True) for model_src in model_src_batch]
+        max_src_len = max(len(ids) for ids in encoded)
+        src_tensor = torch.tensor(
+            [pad_token_ids(ids, max_src_len, src_vocab.pad_idx) for ids in encoded],
+            dtype=torch.long,
+            device=device,
+        )
+
+        batch_hyp_ids, batch_attn = model.greedy_decode_batch(src_tensor, max_len=max_len)
+
+        for hyp_ids, attn_matrix, model_src in zip(batch_hyp_ids, batch_attn, model_src_batch):
+            if replace_unk:
+                tokenised_hyp = replace_unk_with_attention(hyp_ids, attn_matrix, model_src, tgt_vocab)
+            else:
+                tokenised_hyp = tgt_vocab.decode(hyp_ids)
+            hyp = tgt_sp.decode(tokenised_hyp.split()) if tgt_sp is not None and subword_type != "none" else tokenised_hyp
+            hyps.append(hyp)
+
     return hyps
 
 
@@ -1980,6 +2081,7 @@ def translate_rnn_pairs(
     subword_type: str,
     src_sp: Optional["spm.SentencePieceProcessor"],
     tgt_sp: Optional["spm.SentencePieceProcessor"],
+    batch_size: int = 32,
 ) -> List[str]:
     """Translate just the source side of validation/test sentence pairs."""
     return translate_rnn_lines_from_model(
@@ -1993,6 +2095,7 @@ def translate_rnn_pairs(
         subword_type=subword_type,
         src_sp=src_sp,
         tgt_sp=tgt_sp,
+        batch_size=batch_size,
     )
 
 
@@ -2022,6 +2125,7 @@ def show_rnn_val_examples(
         subword_type,
         src_sp,
         tgt_sp,
+        batch_size=args.eval_batch_size or args.batch_size,
     )
     print("\n--- RNN validation examples ---")
     for i, ((src, ref), hyp) in enumerate(zip(subset, hyps), start=1):
@@ -2117,6 +2221,37 @@ def finetune_rnn_seq2seq(args: argparse.Namespace) -> None:
         base, ext = os.path.splitext(args.save)
         save_best = f"{base}.best{ext or '.pt'}"
 
+    # The unified CLI exposes Hugging Face-style early-stopping flags
+    # (--early-stopping-patience, --metric-for-best-model).  The original RNN
+    # script used --early-stopping and --early-metric.  Map both styles onto one
+    # internal monitor so users can use the same command style for HF and RNN
+    # models.
+    monitor_metric = args.early_metric
+    metric_from_hf_style = getattr(args, "metric_for_best_model", None)
+    if metric_from_hf_style:
+        metric_from_hf_style = str(metric_from_hf_style).lower()
+        if metric_from_hf_style == "eval_loss":
+            metric_from_hf_style = "loss"
+        elif metric_from_hf_style.startswith("eval_"):
+            metric_from_hf_style = metric_from_hf_style[5:]
+        if metric_from_hf_style in {"loss", "bleu", "chrf", "ter"}:
+            monitor_metric = metric_from_hf_style
+
+    patience_limit = args.early_stopping
+    if patience_limit <= 0 and getattr(args, "early_stopping_patience", None) is not None:
+        patience_limit = args.early_stopping_patience
+
+    early_stopping_threshold = float(getattr(args, "early_stopping_threshold", 0.0) or 0.0)
+
+    def is_better_for_monitor(curr: float, best: Optional[float]) -> bool:
+        if best is None:
+            return True
+        if monitor_metric in {"loss", "ter"}:
+            return curr < (best - early_stopping_threshold)
+        return curr > (best + early_stopping_threshold)
+
+    print(f"RNN early-stopping monitor: {monitor_metric}; patience={patience_limit}")
+
     history: List[Dict[str, object]] = []
     best_metric: Optional[float] = None
     best_epoch: Optional[int] = None
@@ -2151,7 +2286,7 @@ def finetune_rnn_seq2seq(args: argparse.Namespace) -> None:
             record.update({"val_nll": val_nll, "val_ppl": None if val_ppl == float("inf") else val_ppl})
             log_msg += f"  val NLL={val_nll:.4f} (ppl={val_ppl:.2f})"
 
-            if args.early_metric == "loss":
+            if monitor_metric == "loss":
                 metric_value = val_nll
 
             need_translations = bool(requested_metrics or args.save_eval_translations or args.show_val_examples > 0)
@@ -2170,6 +2305,7 @@ def finetune_rnn_seq2seq(args: argparse.Namespace) -> None:
                     subword_type,
                     src_sp,
                     tgt_sp,
+                    batch_size=args.eval_batch_size or args.batch_size,
                 )
 
             if requested_metrics and hyps is not None and refs is not None:
@@ -2177,8 +2313,8 @@ def finetune_rnn_seq2seq(args: argparse.Namespace) -> None:
                 record.update(metrics)
                 for name, value in metrics.items():
                     log_msg += f"  {name.upper()}={value:.2f}"
-                if args.early_metric in metrics:
-                    metric_value = metrics[args.early_metric]
+                if monitor_metric in metrics:
+                    metric_value = metrics[monitor_metric]
 
             if args.save_eval_translations and hyps is not None and refs is not None:
                 out_dir = args.eval_translations_dir or os.path.join(args.save, "eval_translations")
@@ -2192,24 +2328,24 @@ def finetune_rnn_seq2seq(args: argparse.Namespace) -> None:
 
             if args.show_val_examples > 0 and hyps is not None:
                 print("\n--- RNN validation examples ---")
-                for i, ((src, ref), hyp) in enumerate(zip(val_pairs[: args.show_val_examples], refs[: args.show_val_examples], hyps[: args.show_val_examples]), start=1):
-                    print(f"[{i}] SRC: {src[0] if isinstance(src, tuple) else src}")
+                for i, ((src, ref), hyp) in enumerate(zip(val_pairs[: args.show_val_examples], hyps[: args.show_val_examples]), start=1):
+                    print(f"[{i}] SRC: {src}")
                     print(f"    REF: {ref}")
                     print(f"    HYP: {hyp}")
                 print("-------------------------------")
 
         print(log_msg)
 
-        if metric_value is not None and rnn_metric_is_better(metric_value, best_metric, args.early_metric):
+        if metric_value is not None and is_better_for_monitor(metric_value, best_metric):
             best_metric = metric_value
             best_epoch = epoch
             patience_counter = 0
             save_rnn_checkpoint(save_best, model, optimizer, epoch, src_vocab, tgt_vocab, model_args, best_metric)
-            print(f"  -> New best {args.early_metric}={metric_value:.4f}; saved {save_best}")
-        elif metric_value is not None and args.early_stopping > 0:
+            print(f"  -> New best {monitor_metric}={metric_value:.4f}; saved {save_best}")
+        elif metric_value is not None and patience_limit > 0:
             patience_counter += 1
-            print(f"  -> No improvement on {args.early_metric}; patience={patience_counter}")
-            if patience_counter >= args.early_stopping:
+            print(f"  -> No improvement on {monitor_metric}; patience={patience_counter}/{patience_limit}")
+            if patience_counter >= patience_limit:
                 print("Early stopping triggered.")
                 break
 
@@ -2228,7 +2364,7 @@ def finetune_rnn_seq2seq(args: argparse.Namespace) -> None:
         cleanup_rnn_checkpoints(args.save, args.rnn_keep_last)
 
     if best_epoch is not None:
-        print(f"Training finished. Best {args.early_metric}={best_metric:.4f} at epoch {best_epoch}.")
+        print(f"Training finished. Best {monitor_metric}={best_metric:.4f} at epoch {best_epoch}.")
     else:
         print("Training finished.")
 
@@ -2258,6 +2394,7 @@ def translate_rnn_seq2seq(args: argparse.Namespace) -> None:
         subword_type=subword_type,
         src_sp=src_sp,
         tgt_sp=tgt_sp,
+        batch_size=args.batch_size,
     )
     write_lines(args.out_file, hyps)
     print(f"Loaded RNN checkpoint from {args.model_dir} (epoch {epoch}).")
@@ -2265,6 +2402,573 @@ def translate_rnn_seq2seq(args: argparse.Namespace) -> None:
 
     if args.ref_file:
         refs = read_lines(args.ref_file, lower=args.lower)
+        if len(refs) != len(hyps):
+            raise ValueError(f"Line count mismatch: {len(hyps)} system outputs vs {len(refs)} references.")
+        scores = compute_rnn_sacrebleu_metrics(hyps, refs, parse_metrics(args.metrics))
+        for name, score in scores.items():
+            print(f"{name}: {score:.2f}")
+
+
+
+
+# -----------------------------------------------------------------------------
+# Transformer encoder-decoder from scratch
+# -----------------------------------------------------------------------------
+
+# This model type is intentionally separate from pretrained T5/mBART/M2M/NLLB/
+# MADLAD.  Those pretrained models must keep their original tokenizers.  The
+# scratch Transformer below is randomly initialised and therefore can use the
+# same educational tokenisation choices as the RNN baseline: word-level tokens
+# (`--subword-type none`) or externally trained SentencePiece models
+# (`--subword-type bpe|unigram`).
+
+class PositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding for batch-first Transformer inputs."""
+
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000) -> None:
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        if d_model > 1:
+            pe[:, 1::2] = torch.cos(position * div_term[: pe[:, 1::2].shape[1]])
+        self.register_buffer("pe", pe.unsqueeze(0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.pe[:, : x.size(1)]
+        return self.dropout(x)
+
+
+class ScratchTransformerSeq2Seq(nn.Module):
+    """Small PyTorch Transformer encoder-decoder for MT experiments from scratch."""
+
+    def __init__(
+        self,
+        src_vocab_size: int,
+        tgt_vocab_size: int,
+        src_pad_idx: int,
+        tgt_pad_idx: int,
+        d_model: int = 256,
+        nhead: int = 4,
+        num_encoder_layers: int = 3,
+        num_decoder_layers: int = 3,
+        dim_feedforward: int = 1024,
+        dropout: float = 0.1,
+        max_len: int = 256,
+    ) -> None:
+        super().__init__()
+        self.src_pad_idx = src_pad_idx
+        self.tgt_pad_idx = tgt_pad_idx
+        self.d_model = d_model
+        self.max_len = max_len
+
+        self.src_embedding = nn.Embedding(src_vocab_size, d_model, padding_idx=src_pad_idx)
+        self.tgt_embedding = nn.Embedding(tgt_vocab_size, d_model, padding_idx=tgt_pad_idx)
+        self.positional_encoding = PositionalEncoding(d_model, dropout=dropout, max_len=max_len + 5)
+        self.transformer = nn.Transformer(
+            d_model=d_model,
+            nhead=nhead,
+            num_encoder_layers=num_encoder_layers,
+            num_decoder_layers=num_decoder_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.output_projection = nn.Linear(d_model, tgt_vocab_size)
+
+    def make_tgt_mask(self, tgt_len: int, device: torch.device) -> torch.Tensor:
+        # True entries are masked for PyTorch Transformer boolean masks.
+        return torch.triu(torch.ones(tgt_len, tgt_len, dtype=torch.bool, device=device), diagonal=1)
+
+    def forward(self, src: torch.Tensor, tgt_input: torch.Tensor) -> torch.Tensor:
+        src_key_padding_mask = src == self.src_pad_idx
+        tgt_key_padding_mask = tgt_input == self.tgt_pad_idx
+        tgt_mask = self.make_tgt_mask(tgt_input.size(1), tgt_input.device)
+
+        src_emb = self.positional_encoding(self.src_embedding(src) * math.sqrt(self.d_model))
+        tgt_emb = self.positional_encoding(self.tgt_embedding(tgt_input) * math.sqrt(self.d_model))
+        hidden = self.transformer(
+            src_emb,
+            tgt_emb,
+            tgt_mask=tgt_mask,
+            src_key_padding_mask=src_key_padding_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=src_key_padding_mask,
+        )
+        return self.output_projection(hidden)
+
+    @torch.no_grad()
+    def greedy_decode(self, src: torch.Tensor, sos_idx: int, eos_idx: int, max_len: Optional[int] = None) -> List[int]:
+        self.eval()
+        max_len = max_len or self.max_len
+        generated = torch.full((src.size(0), 1), sos_idx, dtype=torch.long, device=src.device)
+        for _ in range(max_len):
+            logits = self.forward(src, generated)
+            next_token = logits[:, -1].argmax(dim=-1, keepdim=True)
+            generated = torch.cat([generated, next_token], dim=1)
+            if bool((next_token == eos_idx).all()):
+                break
+        return generated[0, 1:].tolist()
+
+    @torch.no_grad()
+    def greedy_decode_batch(
+        self,
+        src: torch.Tensor,
+        sos_idx: int,
+        eos_idx: int,
+        max_len: Optional[int] = None,
+    ) -> List[List[int]]:
+        """Greedy decode a padded mini-batch."""
+        self.eval()
+        max_len = max_len or self.max_len
+        batch_size = src.size(0)
+        generated = torch.full((batch_size, 1), sos_idx, dtype=torch.long, device=src.device)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=src.device)
+        hyp_ids: List[List[int]] = [[] for _ in range(batch_size)]
+
+        for _ in range(max_len):
+            logits = self.forward(src, generated)
+            next_token = logits[:, -1].argmax(dim=-1)
+            generated = torch.cat([generated, next_token.unsqueeze(1)], dim=1)
+
+            for i, token in enumerate(next_token.tolist()):
+                if finished[i]:
+                    continue
+                if token == eos_idx:
+                    finished[i] = True
+                else:
+                    hyp_ids[i].append(token)
+
+            if bool(finished.all()):
+                break
+
+        return hyp_ids
+
+
+def build_scratch_transformer_model(
+    src_vocab: Vocab,
+    tgt_vocab: Vocab,
+    model_args: Dict[str, object],
+    device: torch.device,
+) -> ScratchTransformerSeq2Seq:
+    """Construct a randomly initialised Transformer from stored/CLI arguments."""
+    return ScratchTransformerSeq2Seq(
+        src_vocab_size=len(src_vocab.idx2word),
+        tgt_vocab_size=len(tgt_vocab.idx2word),
+        src_pad_idx=src_vocab.pad_idx,
+        tgt_pad_idx=tgt_vocab.pad_idx,
+        d_model=int(model_args.get("d_model", 256)),
+        nhead=int(model_args.get("nhead", 4)),
+        num_encoder_layers=int(model_args.get("num_encoder_layers", 3)),
+        num_decoder_layers=int(model_args.get("num_decoder_layers", 3)),
+        dim_feedforward=int(model_args.get("dim_feedforward", 1024)),
+        dropout=float(model_args.get("dropout", 0.1)),
+        max_len=int(model_args.get("max_len", 256)),
+    ).to(device)
+
+
+def compute_scratch_transformer_loss(
+    model: ScratchTransformerSeq2Seq,
+    batch: Tuple[torch.Tensor, torch.Tensor],
+    criterion: nn.Module,
+    device: torch.device,
+) -> torch.Tensor:
+    src, tgt = batch
+    src = src.to(device)
+    tgt = tgt.to(device)
+    tgt_input = tgt[:, :-1]
+    gold = tgt[:, 1:].contiguous()
+    logits = model(src, tgt_input)
+    return criterion(logits.reshape(-1, logits.size(-1)), gold.reshape(-1))
+
+
+def evaluate_scratch_transformer_nll(
+    model: ScratchTransformerSeq2Seq,
+    data_loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    pad_idx: int,
+) -> float:
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+    with torch.no_grad():
+        for src, tgt in data_loader:
+            src = src.to(device)
+            tgt = tgt.to(device)
+            tgt_input = tgt[:, :-1]
+            gold = tgt[:, 1:].contiguous()
+            logits = model(src, tgt_input)
+            loss = criterion(logits.reshape(-1, logits.size(-1)), gold.reshape(-1))
+            num_tokens = (gold != pad_idx).sum().item()
+            total_loss += loss.item() * num_tokens
+            total_tokens += num_tokens
+    return total_loss / max(total_tokens, 1)
+
+
+def save_scratch_transformer_checkpoint(
+    path: str,
+    model: ScratchTransformerSeq2Seq,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    src_vocab: Vocab,
+    tgt_vocab: Vocab,
+    model_args: Dict[str, object],
+    best_metric: Optional[float] = None,
+) -> None:
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "epoch": epoch,
+            "src_vocab": src_vocab,
+            "tgt_vocab": tgt_vocab,
+            "model_args": model_args,
+            "best_metric": best_metric,
+        },
+        path,
+    )
+
+
+def load_scratch_transformer_checkpoint(path: str, device: torch.device):
+    try:
+        from torch.serialization import safe_globals
+
+        with safe_globals([Vocab]):
+            ckpt = torch.load(path, map_location=device)
+    except Exception:
+        ckpt = torch.load(path, map_location=device)
+    src_vocab: Vocab = ckpt["src_vocab"]
+    tgt_vocab: Vocab = ckpt["tgt_vocab"]
+    model_args: Dict[str, object] = ckpt["model_args"]
+    model = build_scratch_transformer_model(src_vocab, tgt_vocab, model_args, device)
+    model.load_state_dict(ckpt["model_state"])
+    optimizer = torch.optim.Adam(model.parameters())
+    optimizer.load_state_dict(ckpt["optimizer_state"])
+    return model, optimizer, src_vocab, tgt_vocab, model_args, int(ckpt.get("epoch", 0))
+
+
+def scratch_epoch_checkpoint_path(save_path: str, epoch: int) -> str:
+    if save_path.endswith(".pt"):
+        return re.sub(r"\.pt$", f".epoch{epoch:03d}.pt", save_path)
+    return f"{save_path}.epoch{epoch:03d}.pt"
+
+
+def cleanup_scratch_checkpoints(save_path: str, keep_last: int) -> None:
+    prefix = save_path[:-3] if save_path.endswith(".pt") else save_path
+    checkpoints = sorted(glob.glob(f"{prefix}.epoch*.pt"))
+    if keep_last <= 0:
+        for checkpoint in checkpoints:
+            os.remove(checkpoint)
+        return
+    for checkpoint in checkpoints[:-keep_last]:
+        os.remove(checkpoint)
+
+
+def translate_scratch_transformer_lines(
+    model: ScratchTransformerSeq2Seq,
+    src_lines: Sequence[str],
+    src_vocab: Vocab,
+    tgt_vocab: Vocab,
+    device: torch.device,
+    max_len: int,
+    subword_type: str = "none",
+    src_sp: Optional[object] = None,
+    tgt_sp: Optional[object] = None,
+    batch_size: int = 32,
+) -> List[str]:
+    """Translate source strings with the scratch Transformer in batches."""
+    hyps: List[str] = []
+    model.eval()
+    batch_size = max(1, int(batch_size))
+
+    for batch in tqdm(list(batched(src_lines, batch_size)), desc="Translating", leave=False):
+        model_src_batch = [
+            " ".join(src_sp.encode(src_sentence, out_type=str))
+            if src_sp is not None and subword_type != "none"
+            else src_sentence
+            for src_sentence in batch
+        ]
+        encoded = [src_vocab.encode(model_src, add_eos=True) for model_src in model_src_batch]
+        max_src_len = max(len(ids) for ids in encoded)
+        src_tensor = torch.tensor(
+            [pad_token_ids(ids, max_src_len, src_vocab.pad_idx) for ids in encoded],
+            dtype=torch.long,
+            device=device,
+        )
+
+        batch_hyp_ids = model.greedy_decode_batch(
+            src_tensor,
+            tgt_vocab.sos_idx,
+            tgt_vocab.eos_idx,
+            max_len=max_len,
+        )
+
+        for hyp_ids in batch_hyp_ids:
+            tokenised_hyp = tgt_vocab.decode(hyp_ids)
+            hyp = tgt_sp.decode(tokenised_hyp.split()) if tgt_sp is not None and subword_type != "none" else tokenised_hyp
+            hyps.append(hyp)
+
+    return hyps
+
+
+def translate_scratch_transformer_pairs(
+    model: ScratchTransformerSeq2Seq,
+    pairs: Sequence[Tuple[str, str]],
+    src_vocab: Vocab,
+    tgt_vocab: Vocab,
+    device: torch.device,
+    max_len: int,
+    subword_type: str,
+    src_sp: Optional[object],
+    tgt_sp: Optional[object],
+    batch_size: int = 32,
+) -> List[str]:
+    return translate_scratch_transformer_lines(
+        model,
+        [src for src, _ in pairs],
+        src_vocab,
+        tgt_vocab,
+        device,
+        max_len=max_len,
+        subword_type=subword_type,
+        src_sp=src_sp,
+        tgt_sp=tgt_sp,
+        batch_size=batch_size,
+    )
+
+
+def finetune_scratch_transformer(args: argparse.Namespace) -> None:
+    """Train or resume a Transformer encoder-decoder from random initialisation."""
+    device_name = args.device if hasattr(args, "device") and args.device else ("cuda" if torch.cuda.is_available() else "cpu")
+    if device_name == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but not available.")
+    device = torch.device(device_name)
+    set_rnn_seed(args.seed)
+
+    subword_type, src_sp, tgt_sp = load_sentencepiece_processors(args)
+    train_pairs = read_parallel(args.src_file, args.tgt_file, lower=args.lower, limit=args.limit)
+    if not train_pairs:
+        raise ValueError("No training sentence pairs were loaded.")
+    val_pairs = read_parallel(args.src_val, args.tgt_val, lower=args.lower) if args.src_val and args.tgt_val else None
+
+    if args.scratch_load:
+        model, optimizer, src_vocab, tgt_vocab, model_args, stored_epoch = load_scratch_transformer_checkpoint(args.scratch_load, device)
+        subword_type, src_sp, tgt_sp = load_sentencepiece_processors(model_args)
+        start_epoch = stored_epoch + 1
+        print(f"Loaded scratch Transformer checkpoint from {args.scratch_load}; resuming at epoch {start_epoch}.")
+    else:
+        train_pairs_tok = apply_sentencepiece_to_pairs(train_pairs, src_sp, tgt_sp)
+        src_vocab = build_vocab([src for src, _ in train_pairs_tok], max_size=args.max_src_vocab)
+        tgt_vocab = build_vocab([tgt for _, tgt in train_pairs_tok], max_size=args.max_tgt_vocab)
+        model_args = {
+            "model_type": "transformer-scratch",
+            "d_model": args.d_model,
+            "nhead": args.nhead,
+            "num_encoder_layers": args.transformer_enc_layers,
+            "num_decoder_layers": args.transformer_dec_layers,
+            "dim_feedforward": args.dim_feedforward,
+            "dropout": args.dropout,
+            "max_len": args.max_len,
+            "subword_type": args.subword_type,
+            "src_sp_model": args.src_sp_model,
+            "tgt_sp_model": args.tgt_sp_model,
+            "lower": args.lower,
+        }
+        model = build_scratch_transformer_model(src_vocab, tgt_vocab, model_args, device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        start_epoch = 1
+        print(f"Source vocab size: {len(src_vocab.idx2word)}")
+        print(f"Target vocab size: {len(tgt_vocab.idx2word)}")
+
+    train_pairs_tok = apply_sentencepiece_to_pairs(train_pairs, src_sp, tgt_sp)
+    val_pairs_tok = apply_sentencepiece_to_pairs(val_pairs, src_sp, tgt_sp)
+    train_dataset = RNNParallelDataset(train_pairs_tok, src_vocab, tgt_vocab, max_len=args.max_len)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=lambda batch: rnn_collate_fn(batch, src_vocab.pad_idx, tgt_vocab.pad_idx),
+    )
+    val_loader = None
+    if val_pairs_tok is not None:
+        val_dataset = RNNParallelDataset(val_pairs_tok, src_vocab, tgt_vocab, max_len=None)
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.eval_batch_size or args.batch_size,
+            shuffle=False,
+            collate_fn=lambda batch: rnn_collate_fn(batch, src_vocab.pad_idx, tgt_vocab.pad_idx),
+        )
+
+    print(f"Loaded {len(train_pairs)} training pairs; {len(train_dataset)} used after max_len={args.max_len} filtering.")
+    print(f"Total trainable parameters: {count_trainable_parameters(model):,}")
+    criterion = nn.CrossEntropyLoss(ignore_index=tgt_vocab.pad_idx)
+    requested_metrics = parse_metrics(args.metrics) if args.eval_metrics else set()
+    if requested_metrics and sacrebleu is None:
+        raise RuntimeError("sacrebleu is required for scratch Transformer validation metrics: pip install sacrebleu")
+
+    save_best = args.scratch_save_best
+    if save_best is None:
+        base, ext = os.path.splitext(args.save)
+        save_best = f"{base}.best{ext or '.pt'}"
+
+    monitor_metric = str(getattr(args, "metric_for_best_model", None) or args.early_metric).lower()
+    if monitor_metric == "eval_loss":
+        monitor_metric = "loss"
+    elif monitor_metric.startswith("eval_"):
+        monitor_metric = monitor_metric[5:]
+    if monitor_metric not in {"loss", "bleu", "chrf", "ter"}:
+        monitor_metric = "loss"
+    patience_limit = args.early_stopping
+    if patience_limit <= 0 and getattr(args, "early_stopping_patience", None) is not None:
+        patience_limit = args.early_stopping_patience
+    threshold = float(getattr(args, "early_stopping_threshold", 0.0) or 0.0)
+
+    def is_better(curr: float, best: Optional[float]) -> bool:
+        if best is None:
+            return True
+        if monitor_metric in {"loss", "ter"}:
+            return curr < best - threshold
+        return curr > best + threshold
+
+    print(f"Scratch Transformer early-stopping monitor: {monitor_metric}; patience={patience_limit}")
+    history: List[Dict[str, object]] = []
+    best_metric: Optional[float] = None
+    best_epoch: Optional[int] = None
+    patience_counter = 0
+
+    for epoch in range(start_epoch, args.epochs + 1):
+        model.train()
+        total_loss = 0.0
+        total_tokens = 0
+        for src, tgt in tqdm(train_loader, desc=f"Transformer epoch {epoch}", leave=False):
+            optimizer.zero_grad()
+            loss = compute_scratch_transformer_loss(model, (src, tgt), criterion, device)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            with torch.no_grad():
+                gold = tgt[:, 1:].contiguous()
+                n_tokens = (gold != tgt_vocab.pad_idx).sum().item()
+                total_loss += loss.item() * n_tokens
+                total_tokens += n_tokens
+
+        train_nll = total_loss / max(total_tokens, 1)
+        train_ppl = math.exp(train_nll) if train_nll < 20 else float("inf")
+        record: Dict[str, object] = {"epoch": epoch, "train_nll": train_nll, "train_ppl": None if train_ppl == float("inf") else train_ppl}
+        log_msg = f"Epoch {epoch:03d}: train NLL={train_nll:.4f} (ppl={train_ppl:.2f})"
+        metric_value: Optional[float] = None
+
+        if val_loader is not None and val_pairs is not None:
+            val_nll = evaluate_scratch_transformer_nll(model, val_loader, criterion, device, tgt_vocab.pad_idx)
+            val_ppl = math.exp(val_nll) if val_nll < 20 else float("inf")
+            record.update({"val_nll": val_nll, "val_ppl": None if val_ppl == float("inf") else val_ppl})
+            log_msg += f"  val NLL={val_nll:.4f} (ppl={val_ppl:.2f})"
+            if monitor_metric == "loss":
+                metric_value = val_nll
+
+            need_translations = bool(requested_metrics or args.save_eval_translations or args.show_val_examples > 0)
+            hyps: Optional[List[str]] = None
+            refs: Optional[List[str]] = None
+            if need_translations:
+                refs = [tgt for _, tgt in val_pairs]
+                hyps = translate_scratch_transformer_pairs(
+                    model, val_pairs, src_vocab, tgt_vocab, device, args.max_len, subword_type, src_sp, tgt_sp,
+                    batch_size=args.eval_batch_size or args.batch_size,
+                )
+            if requested_metrics and hyps is not None and refs is not None:
+                metrics = compute_rnn_sacrebleu_metrics(hyps, refs, requested_metrics)
+                record.update(metrics)
+                for name, value in metrics.items():
+                    log_msg += f"  {name.upper()}={value:.2f}"
+                if monitor_metric in metrics:
+                    metric_value = metrics[monitor_metric]
+            if args.save_eval_translations and hyps is not None and refs is not None:
+                out_dir = args.eval_translations_dir or os.path.join(args.save, "eval_translations")
+                os.makedirs(out_dir, exist_ok=True)
+                stem = os.path.join(out_dir, f"transformer_scratch_eval_epoch_{epoch:03d}")
+                write_lines_if_missing(os.path.join(out_dir, "validation.src"), [src for src, _ in val_pairs])
+                write_lines_if_missing(os.path.join(out_dir, "validation.ref"), refs)
+                write_lines(stem + ".hyp", hyps)
+                with open(stem + ".scores.json", "w", encoding="utf-8") as f:
+                    json.dump({k: v for k, v in record.items() if k in {"bleu", "chrf", "ter", "val_nll"}}, f, indent=2, ensure_ascii=False)
+            if args.show_val_examples > 0 and hyps is not None and refs is not None:
+                print("\n--- Scratch Transformer validation examples ---")
+                for i, ((src, ref), hyp) in enumerate(zip(val_pairs[: args.show_val_examples], hyps[: args.show_val_examples]), start=1):
+                    print(f"[{i}] SRC: {src}")
+                    print(f"    REF: {ref}")
+                    print(f"    HYP: {hyp}")
+                print("----------------------------------------------")
+
+        print(log_msg)
+        if metric_value is not None and is_better(metric_value, best_metric):
+            best_metric = metric_value
+            best_epoch = epoch
+            patience_counter = 0
+            save_scratch_transformer_checkpoint(save_best, model, optimizer, epoch, src_vocab, tgt_vocab, model_args, best_metric)
+            print(f"  -> New best {monitor_metric}={metric_value:.4f}; saved {save_best}")
+        elif metric_value is not None and patience_limit > 0:
+            patience_counter += 1
+            print(f"  -> No improvement on {monitor_metric}; patience={patience_counter}/{patience_limit}")
+            if patience_counter >= patience_limit:
+                print("Early stopping triggered.")
+                break
+
+        record["best_metric"] = best_metric
+        record["best_epoch"] = best_epoch
+        history.append(record)
+        if args.history_json:
+            out_dir = os.path.dirname(args.history_json)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            with open(args.history_json, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2, ensure_ascii=False)
+
+        save_path = scratch_epoch_checkpoint_path(args.save, epoch)
+        save_scratch_transformer_checkpoint(save_path, model, optimizer, epoch, src_vocab, tgt_vocab, model_args, best_metric)
+        cleanup_scratch_checkpoints(args.save, args.scratch_keep_last)
+
+    if best_epoch is not None:
+        print(f"Training finished. Best {monitor_metric}={best_metric:.4f} at epoch {best_epoch}.")
+    else:
+        print("Training finished.")
+
+
+def translate_scratch_transformer(args: argparse.Namespace) -> None:
+    """Translate a file with a scratch Transformer checkpoint."""
+    if not args.model_dir:
+        raise ValueError("--model-dir must point to a scratch Transformer .pt checkpoint when --model-type transformer-scratch")
+    device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if device_name == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but not available.")
+    device = torch.device(device_name)
+    set_rnn_seed(getattr(args, "seed", 42))
+    model, _optimizer, src_vocab, tgt_vocab, model_args, epoch = load_scratch_transformer_checkpoint(args.model_dir, device)
+    subword_type, src_sp, tgt_sp = load_sentencepiece_processors(model_args)
+    src_lines = list(iter_lines(args.src_file, lower=bool(model_args.get("lower", args.lower))))
+    hyps = translate_scratch_transformer_lines(
+        model,
+        src_lines,
+        src_vocab,
+        tgt_vocab,
+        device,
+        max_len=int(model_args.get("max_len", args.max_gen_len)),
+        subword_type=subword_type,
+        src_sp=src_sp,
+        tgt_sp=tgt_sp,
+        batch_size=args.batch_size,
+    )
+    write_lines(args.out_file, hyps)
+    print(f"Loaded scratch Transformer checkpoint from {args.model_dir} (epoch {epoch}).")
+    print(f"Wrote {len(hyps)} translations to {args.out_file}")
+    if args.ref_file:
+        refs = read_lines(args.ref_file, lower=bool(model_args.get("lower", args.lower)))
         if len(refs) != len(hyps):
             raise ValueError(f"Line count mismatch: {len(hyps)} system outputs vs {len(refs)} references.")
         scores = compute_rnn_sacrebleu_metrics(hyps, refs, parse_metrics(args.metrics))
@@ -2636,11 +3340,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Comma-separated module names, e.g. q,v or q,k,v,o",
     )
 
-    # RNN-only architecture/training options. These are ignored by HF model
-    # types and allow pre-Transformer baselines to share the same finetune verb.
+    # Custom-from-scratch architecture/training options. These are ignored by pretrained
+    # HF model types. RNN and transformer-scratch can use word tokens or SentencePiece.
     ft.add_argument("--emb-size", type=int, default=64)
     ft.add_argument("--hidden-size", type=int, default=128)
-    ft.add_argument("--max-len", type=int, default=50, help="RNN max sentence/generation length")
+    ft.add_argument("--max-len", type=int, default=50, help="Max sentence/generation length for rnn and transformer-scratch")
     ft.add_argument("--teacher-forcing", type=float, default=0.7)
     ft.add_argument("--enc-layers", type=int, default=1)
     ft.add_argument("--dec-layers", type=int, default=1)
@@ -2659,6 +3363,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ft.add_argument("--early-stopping", type=int, default=0, help="RNN patience in epochs; 0 disables")
     ft.add_argument("--early-metric", choices=["loss", "bleu", "chrf", "ter"], default="loss")
     ft.add_argument("--replace-unk", action="store_true", help="RNN attention-based <unk> replacement")
+    ft.add_argument("--d-model", type=int, default=256, help="Scratch Transformer embedding/hidden size")
+    ft.add_argument("--nhead", type=int, default=4, help="Scratch Transformer attention heads")
+    ft.add_argument("--transformer-enc-layers", type=int, default=3, help="Scratch Transformer encoder layers")
+    ft.add_argument("--transformer-dec-layers", type=int, default=3, help="Scratch Transformer decoder layers")
+    ft.add_argument("--dim-feedforward", type=int, default=1024, help="Scratch Transformer feed-forward size")
+    ft.add_argument("--dropout", type=float, default=0.1, help="Scratch Transformer dropout")
+    ft.add_argument("--scratch-load", default=None, help="Scratch Transformer checkpoint to resume from")
+    ft.add_argument("--scratch-save-best", default=None, help="Best scratch Transformer checkpoint path; default: <save>.best.pt")
+    ft.add_argument("--scratch-keep-last", type=int, default=1, help="Number of scratch Transformer epoch checkpoints to keep")
 
     # Translation subcommand ---------------------------------------------------
     tr = sub.add_parser("translate", help="Translate a source file with a model")
@@ -2730,8 +3443,11 @@ def main() -> None:
         if args.model_type == "rnn":
             finetune_rnn_seq2seq(args)
             return
+        if args.model_type == "transformer-scratch":
+            finetune_scratch_transformer(args)
+            return
         if not args.pretrained_model:
-            raise ValueError("--pretrained-model is required for Hugging Face model types")
+            raise ValueError("--pretrained-model is required for Hugging Face pretrained model types")
         finetune_hf_seq2seq(args)
         return
 
@@ -2746,6 +3462,10 @@ def main() -> None:
 
         if args.model_type == "rnn":
             translate_rnn_seq2seq(args)
+            return
+
+        if args.model_type == "transformer-scratch":
+            translate_scratch_transformer(args)
             return
 
         if not args.model_dir:
