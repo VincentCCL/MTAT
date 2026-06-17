@@ -335,7 +335,8 @@ def main():
     p.add_argument("--label-smoothing", type=float, default=0.0)
     p.add_argument("--logging-steps", type=int, default=50)
     p.add_argument("--save-steps", type=int, default=0)
-
+    p.add_argument("--resume-from-checkpoint", default=None,
+                   help="Path to a Hugging Face checkpoint directory, e.g. model/checkpoint-1000")
     args = p.parse_args()
 
     ensure_dir(args.save)
@@ -446,7 +447,7 @@ def main():
 
     training_args = Seq2SeqTrainingArguments(
         output_dir=args.save,
-        overwrite_output_dir=True,
+        overwrite_output_dir=(args.resume_from_checkpoint is None)
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
@@ -495,7 +496,7 @@ def main():
     )
 
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     trainer.save_model(args.save)
 
     if args.history_json:
