@@ -234,16 +234,20 @@ def main():
         append_log(wrapper_log, f"START: {printable}")
 
         if args.execute:
-            # Store both stdout and stderr in stdout.log so CUDA/Python errors are captured.
             env = os.environ.copy()
-            with open(stdout_file, "w", encoding="utf-8") as log:
-                proc = subprocess.run(
-                    cmd,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    env=env,
-                )
+
+            shell_cmd = (
+                " ".join(shlex.quote(x) for x in cmd)
+                + " 2>&1 | tee "
+                + shlex.quote(str(stdout_file))
+            )
+
+            proc = subprocess.run(
+                shell_cmd,
+                shell=True,
+                executable="/bin/bash",
+                env=env,
+            )
 
             if proc.returncode != 0:
                 reason = classify_failure(proc.returncode, stdout_file)
@@ -254,7 +258,7 @@ def main():
                 print(f"Log: {stdout_file}")
                 print(f"Wrapper log: {wrapper_log}")
                 continue
-
+            
             if model_exists(params, run_base):
                 successful += 1
                 append_log(wrapper_log, "SUCCESS: command returned 0 and model/checkpoint exists")
