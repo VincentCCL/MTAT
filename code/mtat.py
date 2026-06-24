@@ -109,6 +109,25 @@ SCRATCH_TRANSFORMER_TYPES = {"transformer-scratch"}
 FINETUNE_MODEL_TYPES = HF_SEQ2SEQ_TYPES | RNN_SEQ2SEQ_TYPES | SCRATCH_TRANSFORMER_TYPES
 TRANSLATE_MODEL_TYPES = HF_SEQ2SEQ_TYPES | RNN_SEQ2SEQ_TYPES | SCRATCH_TRANSFORMER_TYPES | {"openai"}
 
+def get_default_learning_rate(model_type: str) -> float:
+    """
+    Return a sensible default learning rate for each model family.
+    """
+
+    defaults = {
+        # pretrained HF models
+        "t5": 5e-5,
+        "mbart": 3e-5,
+        "m2m": 5e-5,
+        "nllb": 2e-5,
+        "madlad": 2e-5,
+
+        # models trained from scratch
+        "rnn": 1e-3,
+        "transformer-scratch": 5e-4,
+    }
+
+    return defaults.get(model_type, 5e-5)
 
 # -----------------------------------------------------------------------------
 # Basic file and batching helpers
@@ -3316,7 +3335,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     ft.add_argument("--save", required=True, help="Output directory")
     ft.add_argument("--epochs", type=int, default=3)
-    ft.add_argument("--lr", type=float, default=5e-5)
+    ft.add_argument("--lr", type=float, default=None)
     ft.add_argument("--weight-decay", type=float, default=0.0)
     ft.add_argument("--warmup-steps", type=int, default=0)
     ft.add_argument("--grad-accum", type=int, default=1)
@@ -3484,6 +3503,9 @@ def main() -> None:
             return
         if not args.pretrained_model:
             raise ValueError("--pretrained-model is required for Hugging Face pretrained model types")
+        if args.lr is None:
+            args.lr = get_default_learning_rate(args.model_type)
+    
         finetune_hf_seq2seq(args)
         return
 
