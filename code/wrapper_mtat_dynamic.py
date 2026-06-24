@@ -2,25 +2,41 @@
 """
 wrapper_mtat_dynamic.py
 
-Dynamic hyperparameter search wrapper for mtat.py.
+Dynamic beam-search hyperparameter wrapper for mtat.py.
 
-Unlike wrapper_mtat_resumable_v2.py, this script does not enumerate the full
-Cartesian product of --values/--range. Instead it repeatedly proposes one run,
-executes it, reads its history.json, and uses the observed score to bias the next
-proposal.
+This script searches over hyperparameters without enumerating the full Cartesian
+product. It keeps a beam of the best completed configurations and expands each
+beam item into nearby candidate configurations for the next generation.
 
-Search strategy:
-  1. random exploration for the first --random-starts trials
-  2. local mutation around the best completed runs afterwards
+Typical use:
 
-This keeps the script dependency-free and easy to explain in class. It is not a
-full Bayesian optimiser, but it behaves like a practical dynamic search: later
-trials depend on earlier results.
+  python wrapper_mtat_dynamic.py \
+    --mtat mtat.py \
+    --command finetune \
+    --execute \
+    --generations 5 \
+    --beam-width 5 \
+    --expand-per-parent 3 \
+    --metric bleu \
+    --direction max \
+    --set model-type=rnn \
+    --values rnn-type=rnn,gru,lstm \
+    --values hidden-size=32,64,128 \
+    --save-template 'runs/beam_{rnn_type}_{hidden_size}'
+
+Notes:
+- --set supplies fixed mtat.py arguments.
+- --values and --range define the hyperparameter search space.
+- generation 1 starts with random candidates.
+- later generations expand/mutate the current best beam.
+- --model-type rnn is passed through correctly.
+- --early-stopping-patience is accepted as an alias for --early-stopping.
 """
 
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
 import os
@@ -29,7 +45,7 @@ import shlex
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 ARGPARSE_MARKERS = (
     "usage:",
@@ -48,9 +64,16 @@ OOM_MARKERS = (
     "cannot allocate memory",
 )
 
-LOWER_IS_BETTER = {"loss", "eval_loss", "val_loss", "validation_loss", "nll", "val_nll", "eval_nll", "ter"}
-HIGHER_IS_BETTER = {"bleu", "eval_bleu", "val_bleu", "chrf", "eval_chrf", "accuracy"}
+LOWER_IS_BETTER = {
+    "loss", "eval_loss", "val_loss", "validation_loss", "nll", "val_nll",
+    "eval_nll", "ter", "eval_ter", "val_ter"
+}
+HIGHER_IS_BETTER = {
+    "bleu", "eval_bleu", "val_bleu", "chrf", "eval_chrf", "val_chrf",
+    "accuracy", "eval_accuracy", "val_accuracy"
+}
 
+# These are generated/used by the wrapper and should not be passed to mtat.py.
 WRAPPER_ONLY_KEYS = {"log_file", "run_dir"}
 
 
@@ -62,66 +85,58 @@ def cli_key(key: str) -> str:
     return key.replace("_", "-")
 
 
+def canonical_key(key: str) -> str:
+    key = normalize_key(key)
+    # Compatibility alias: MTAT RNN uses --early-stopping.
+    if key == "early_stopping_patience":
+        return "early_stopping"
+    return key
+
+
 def parse_kv(text: str) -> Tuple[str, str]:
     if "=" not in text:
         raise ValueError(f"--set expects key=value, got: {text}")
     key, value = text.split("=", 1)
-    key = normalize_key(key)
-    # Compatibility alias: MTAT RNN uses --early-stopping, not --early-stopping-patience.
-    if key == "early_stopping_patience":
-        key = "early_stopping"
-    return key, value.strip()
+    return canonical_key(key), value.strip()
 
 
 def parse_values(text: str) -> Tuple[str, List[str]]:
     if "=" not in text:
         raise ValueError(f"--values expects key=v1,v2,v3, got: {text}")
     key, values = text.split("=", 1)
-    key = normalize_key(key)
-    if key == "early_stopping_patience":
-        key = "early_stopping"
-    return key, [v.strip() for v in values.split(",") if v.strip()]
+    vals = [v.strip() for v in values.split(",") if v.strip()]
+    if not vals:
+        raise ValueError(f"--values for {key} is empty")
+    return canonical_key(key), vals
 
 
 def parse_range(text: str) -> Tuple[str, List[str]]:
     if "=" not in text:
         raise ValueError(f"--range expects key=start:stop:step, got: {text}")
-
     key, spec = text.split("=", 1)
     start, stop, step = map(float, spec.split(":"))
     if step <= 0:
         raise ValueError("--range step must be > 0")
-
     values: List[str] = []
     x = start
     while x <= stop + 1e-12:
         values.append(f"{x:g}")
         x += step
-    return normalize_key(key), values
-
-
-def as_number(value: str) -> Optional[float]:
-    try:
-        return float(value)
-    except Exception:
-        return None
+    return canonical_key(key), values
 
 
 def add_arg(cmd: List[str], key: str, value: Any) -> None:
     option = f"--{cli_key(key)}"
-
     if isinstance(value, bool):
         if value:
             cmd.append(option)
         return
-
     value_str = str(value)
     if value_str.lower() == "true":
         cmd.append(option)
         return
     if value_str.lower() == "false":
         return
-
     cmd.extend([option, value_str])
 
 
@@ -135,58 +150,14 @@ def append_log(path: Path, message: str) -> None:
         f.write(f"[{timestamp()}] {message}\n")
 
 
-def model_exists(params: Dict[str, Any], run_base: Path) -> bool:
-    model_type = params.get("model_type")
-
-    if model_type == "rnn":
-        candidates = []
-        for key in ("save", "rnn_save_best"):
-            if key in params:
-                candidates.append(Path(str(params[key])))
-        candidates.extend([run_base / "model.pt", run_base / "best.pt"])
-        return any(p.is_file() and p.stat().st_size > 0 for p in candidates)
-
-    model_files = [
-        "pytorch_model.bin",
-        "model.safetensors",
-        "tf_model.h5",
-        "flax_model.msgpack",
-        "checkpoint_best.pt",
-        "model.pt",
-        "best.pt",
-    ]
-    if any((run_base / name).is_file() and (run_base / name).stat().st_size > 0 for name in model_files):
-        return True
-
-    for child in run_base.glob("checkpoint-*"):
-        if child.is_dir() and any((child / name).is_file() for name in model_files):
-            return True
-
-    return False
-
-
-def classify_failure(returncode: int, stdout_file: Path) -> str:
-    reason = f"return code {returncode}"
-
-    if returncode < 0:
-        reason += f"; terminated by signal {-returncode}"
-    elif returncode == 137:
-        reason += "; likely killed by SIGKILL, often OOM"
-
+def as_number(value: str) -> Optional[float]:
     try:
-        text = stdout_file.read_text(encoding="utf-8", errors="ignore").lower()
-    except FileNotFoundError:
-        text = ""
-
-    if returncode == 2 and any(marker in text for marker in ARGPARSE_MARKERS):
-        reason += "; likely mtat.py argument/CLI error"
-    if any(marker in text for marker in OOM_MARKERS):
-        reason += "; log contains OOM/killed marker"
-
-    return reason
+        return float(value)
+    except Exception:
+        return None
 
 
-def metric_direction(metric: str, explicit: Optional[str]) -> str:
+def metric_direction(metric: str, explicit: str) -> str:
     if explicit in {"min", "max"}:
         return explicit
     m = metric.lower().removeprefix("eval_").removeprefix("val_")
@@ -197,16 +168,17 @@ def metric_direction(metric: str, explicit: Optional[str]) -> str:
     return "max"
 
 
-def score_is_better(a: float, b: float, direction: str) -> bool:
-    return a < b if direction == "min" else a > b
-
-
 def metric_from_record(record: Dict[str, Any], metric: str) -> Optional[float]:
     candidates = [metric]
     if not metric.startswith("eval_"):
         candidates.append("eval_" + metric)
     if not metric.startswith("val_"):
         candidates.append("val_" + metric)
+    # common MTAT/RNN names
+    if metric == "bleu":
+        candidates.extend(["valid_bleu", "validation_bleu", "dev_bleu"])
+    if metric in {"loss", "nll"}:
+        candidates.extend(["val_loss", "valid_loss", "validation_loss", "eval_loss"])
 
     for key in candidates:
         value = record.get(key)
@@ -232,6 +204,15 @@ def read_best_score(history_json: Path, metric: str, direction: str) -> Optional
                 if value is not None:
                     values.append(value)
     elif isinstance(history, dict):
+        # Some histories store a list under common keys.
+        for maybe_key in ("history", "log_history", "records", "epochs"):
+            seq = history.get(maybe_key)
+            if isinstance(seq, list):
+                for record in seq:
+                    if isinstance(record, dict):
+                        value = metric_from_record(record, metric)
+                        if value is not None:
+                            values.append(value)
         value = metric_from_record(history, metric)
         if value is not None:
             values.append(value)
@@ -241,69 +222,108 @@ def read_best_score(history_json: Path, metric: str, direction: str) -> Optional
     return min(values) if direction == "min" else max(values)
 
 
+def score_sort_key(item: Dict[str, Any], direction: str) -> float:
+    score = item.get("score")
+    if score is None:
+        return math.inf if direction == "min" else -math.inf
+    return float(score)
+
+
+def rank_completed(completed: List[Dict[str, Any]], direction: str) -> List[Dict[str, Any]]:
+    return sorted(completed, key=lambda x: score_sort_key(x, direction), reverse=(direction == "max"))
+
+
 def params_id(params: Dict[str, Any], search_keys: Iterable[str]) -> Tuple[Tuple[str, str], ...]:
-    return tuple(sorted((key, str(params[key])) for key in search_keys))
+    return tuple(sorted((key, str(params[key])) for key in search_keys if key in params))
 
 
 def choose_random(space: Dict[str, List[str]], rng: random.Random) -> Dict[str, str]:
     return {key: rng.choice(values) for key, values in space.items()}
 
 
-def mutate_from_parent(parent: Dict[str, Any], space: Dict[str, List[str]], rng: random.Random, mutation_rate: float) -> Dict[str, str]:
-    child: Dict[str, str] = {}
-    for key, values in space.items():
-        current = str(parent[key])
-        if rng.random() > mutation_rate and current in values:
-            child[key] = current
-            continue
+def neighbor_values(values: List[str], current: str, rng: random.Random) -> List[str]:
+    if current not in values:
+        return [rng.choice(values)]
+    idx = values.index(current)
+    numeric_values = [as_number(v) for v in values]
+    if all(v is not None for v in numeric_values):
+        candidates = []
+        if idx > 0:
+            candidates.append(values[idx - 1])
+        if idx + 1 < len(values):
+            candidates.append(values[idx + 1])
+        if not candidates:
+            candidates = [v for v in values if v != current]
+        return candidates or values
+    return [v for v in values if v != current] or values
 
-        # Numeric values are mutated locally; categorical values are resampled.
-        current_idx = values.index(current) if current in values else None
-        numeric_values = [as_number(v) for v in values]
-        if current_idx is not None and all(v is not None for v in numeric_values) and len(values) > 1:
-            step = rng.choice([-1, 1])
-            new_idx = max(0, min(len(values) - 1, current_idx + step))
-            if new_idx == current_idx and len(values) > 2:
-                new_idx = rng.randrange(len(values))
-            child[key] = values[new_idx]
-        else:
-            alternatives = [v for v in values if v != current]
-            child[key] = rng.choice(alternatives or values)
+
+def mutate_one_or_more(parent: Dict[str, Any], space: Dict[str, List[str]], rng: random.Random, max_changes: int = 2) -> Dict[str, str]:
+    child = {key: str(parent.get(key, rng.choice(values))) for key, values in space.items()}
+    keys = list(space.keys())
+    rng.shuffle(keys)
+    n_changes = rng.randint(1, max(1, min(max_changes, len(keys))))
+    for key in keys[:n_changes]:
+        current = child[key]
+        options = neighbor_values(space[key], current, rng)
+        child[key] = rng.choice(options)
     return child
 
 
-def propose_params(
+def initial_candidates(
     fixed: Dict[str, str],
     space: Dict[str, List[str]],
-    completed: List[Dict[str, Any]],
-    tried: set,
-    random_starts: int,
-    top_k: int,
-    mutation_rate: float,
+    n: int,
     rng: random.Random,
-    max_attempts: int = 500,
-) -> Optional[Dict[str, Any]]:
+    tried: Set[Tuple[Tuple[str, str], ...]],
+    max_attempts: int = 10000,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
     search_keys = list(space.keys())
-
-    for attempt in range(max_attempts):
-        if len(completed) < random_starts:
-            candidate_dynamic = choose_random(space, rng)
-        else:
-            ranked = completed[: max(1, min(top_k, len(completed)))]
-            parent = rng.choice(ranked)["params"]
-            candidate_dynamic = mutate_from_parent(parent, space, rng, mutation_rate)
-
-            # Keep some exploration after random starts.
-            if rng.random() < 0.20:
-                candidate_dynamic = choose_random(space, rng)
-
+    for _ in range(max_attempts):
+        if len(out) >= n:
+            break
         candidate = dict(fixed)
-        candidate.update(candidate_dynamic)
+        candidate.update(choose_random(space, rng))
         pid = params_id(candidate, search_keys)
         if pid not in tried:
-            return candidate
+            tried.add(pid)
+            out.append(candidate)
+    return out
 
-    return None
+
+def expand_beam(
+    beam: List[Dict[str, Any]],
+    fixed: Dict[str, str],
+    space: Dict[str, List[str]],
+    expand_per_parent: int,
+    rng: random.Random,
+    tried: Set[Tuple[Tuple[str, str], ...]],
+    random_fraction: float = 0.20,
+    max_attempts: int = 10000,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    search_keys = list(space.keys())
+    target = max(1, len(beam)) * max(1, expand_per_parent)
+    attempts = 0
+
+    while len(out) < target and attempts < max_attempts:
+        attempts += 1
+        if not beam or rng.random() < random_fraction:
+            dynamic = choose_random(space, rng)
+        else:
+            parent_record = rng.choice(beam)
+            parent = parent_record["params"]
+            dynamic = mutate_one_or_more(parent, space, rng)
+
+        candidate = dict(fixed)
+        candidate.update(dynamic)
+        pid = params_id(candidate, search_keys)
+        if pid in tried:
+            continue
+        tried.add(pid)
+        out.append(candidate)
+    return out
 
 
 def apply_templates(params: Dict[str, Any], save_template: Optional[str], out_template: Optional[str]) -> None:
@@ -338,8 +358,124 @@ def build_command(py: str, mtat: str, command: str, params: Dict[str, Any]) -> L
     return cmd
 
 
+def model_exists(params: Dict[str, Any], run_base: Path) -> bool:
+    model_type = params.get("model_type")
+    if model_type == "rnn":
+        candidates = []
+        for key in ("save", "rnn_save_best"):
+            if key in params:
+                candidates.append(Path(str(params[key])))
+        candidates.extend([run_base / "model.pt", run_base / "best.pt"])
+        return any(p.is_file() and p.stat().st_size > 0 for p in candidates)
+
+    model_files = [
+        "pytorch_model.bin", "model.safetensors", "tf_model.h5",
+        "flax_model.msgpack", "checkpoint_best.pt", "model.pt", "best.pt",
+    ]
+    if any((run_base / name).is_file() and (run_base / name).stat().st_size > 0 for name in model_files):
+        return True
+    for child in run_base.glob("checkpoint-*"):
+        if child.is_dir() and any((child / name).is_file() for name in model_files):
+            return True
+    return False
+
+
+def classify_failure(returncode: int, stdout_file: Path) -> str:
+    reason = f"return code {returncode}"
+    if returncode < 0:
+        reason += f"; terminated by signal {-returncode}"
+    elif returncode == 137:
+        reason += "; likely killed by SIGKILL, often OOM"
+
+    try:
+        text = stdout_file.read_text(encoding="utf-8", errors="ignore").lower()
+    except FileNotFoundError:
+        text = ""
+
+    if returncode == 2 and any(marker in text for marker in ARGPARSE_MARKERS):
+        reason += "; likely mtat.py argument/CLI error"
+    if any(marker in text for marker in OOM_MARKERS):
+        reason += "; log contains OOM/killed marker"
+    return reason
+
+
+def run_candidate(
+    params_in: Dict[str, Any],
+    args: argparse.Namespace,
+    generation: int,
+    trial_in_generation: int,
+    global_trial: int,
+    direction: str,
+    study_log: Path,
+) -> Optional[Dict[str, Any]]:
+    params = dict(params_in)
+    apply_templates(params, args.save_template, args.out_template)
+
+    run_base = Path(str(params.get("run_dir", params.get("save"))))
+    run_base.mkdir(parents=True, exist_ok=True)
+    wrapper_log = run_base / "wrapper.log"
+    stdout_file = Path(str(params.get("log_file", run_base / "stdout.log")))
+    history_file = Path(str(params.get("history_json", run_base / "history.json")))
+
+    cmd = build_command(args.python, args.mtat, args.command, params)
+    printable = " ".join(shlex.quote(x) for x in cmd)
+
+    print(f"\n=== Generation {generation}, trial {trial_in_generation} ===")
+    print(printable)
+    append_log(wrapper_log, f"START generation={generation} trial={trial_in_generation} global_trial={global_trial}: {printable}")
+
+    event: Dict[str, Any] = {
+        "timestamp": timestamp(),
+        "generation": generation,
+        "trial_in_generation": trial_in_generation,
+        "global_trial": global_trial,
+        "params": params,
+        "search_params": params_in,
+        "command": printable,
+        "metric": args.metric,
+        "direction": direction,
+    }
+
+    completed_record: Optional[Dict[str, Any]] = None
+
+    if not args.force and model_exists(params, run_base):
+        score = read_best_score(history_file, args.metric, direction)
+        event.update({"status": "skipped_existing", "score": score})
+        print(f"SKIP: model/checkpoint exists: {run_base}")
+        if score is not None:
+            completed_record = {"score": score, "params": params_in, "run_base": str(run_base)}
+    elif args.execute:
+        with open(stdout_file, "w", encoding="utf-8") as log:
+            proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, text=True, env=os.environ.copy())
+
+        if proc.returncode != 0:
+            reason = classify_failure(proc.returncode, stdout_file)
+            event.update({"status": "failed", "reason": reason})
+            append_log(wrapper_log, f"FAILED: {reason}")
+            print(f"FAILED: {reason}")
+        elif not model_exists(params, run_base):
+            reason = "command returned 0 but no expected model/checkpoint was found"
+            event.update({"status": "failed", "reason": reason})
+            append_log(wrapper_log, f"FAILED: {reason}")
+            print(f"FAILED: {reason}")
+        else:
+            score = read_best_score(history_file, args.metric, direction)
+            event.update({"status": "success", "score": score})
+            append_log(wrapper_log, f"SUCCESS: score={score}")
+            print(f"SUCCESS: {args.metric}={score}")
+            if score is not None:
+                completed_record = {"score": score, "params": params_in, "run_base": str(run_base)}
+    else:
+        event.update({"status": "planned"})
+
+    with open(study_log, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    return completed_record
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Dynamic hyperparameter search wrapper for mtat.py")
+    ap = argparse.ArgumentParser(description="Dynamic beam-search hyperparameter wrapper for mtat.py")
     ap.add_argument("--mtat", default="mtat.py")
     ap.add_argument("--python", default="python")
     ap.add_argument("--command", required=True, choices=["finetune", "translate"])
@@ -348,14 +484,23 @@ def main() -> None:
     ap.add_argument("--values", action="append", default=[], help="Search values, key=v1,v2,v3")
     ap.add_argument("--range", action="append", default=[], help="Search range, key=start:stop:step")
 
-    ap.add_argument("--save-template", required=True, help="Template for run directories, e.g. runs/dyn_bs{batch_size}_lr{lr}")
+    ap.add_argument("--save-template", required=True, help="Template for run directories")
     ap.add_argument("--out-template", default=None)
-    ap.add_argument("--study-dir", default=None, help="Directory for dynamic_search.jsonl; default is parent of save-template")
+    ap.add_argument("--study-dir", default=None, help="Directory for dynamic_beam_search.jsonl; default is parent of save-template")
 
-    ap.add_argument("--trials", type=int, default=20)
-    ap.add_argument("--random-starts", type=int, default=5)
-    ap.add_argument("--top-k", type=int, default=3)
-    ap.add_argument("--mutation-rate", type=float, default=0.5)
+    # Beam-search controls.
+    ap.add_argument("--generations", type=int, default=5, help="Number of beam-search generations")
+    ap.add_argument("--beam-width", type=int, default=5, help="Number of best configs kept after each generation")
+    ap.add_argument("--expand-per-parent", type=int, default=3, help="Candidates generated per beam item")
+    ap.add_argument("--initial-candidates", type=int, default=None, help="Generation-1 candidates; default beam_width * expand_per_parent")
+    ap.add_argument("--random-fraction", type=float, default=0.20, help="Fraction of candidates sampled fully randomly after generation 1")
+
+    # Backwards-compatible dynamic-wrapper aliases. They are accepted, but beam args are preferred.
+    ap.add_argument("--trials", type=int, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--random-starts", type=int, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--top-k", type=int, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--mutation-rate", type=float, default=None, help=argparse.SUPPRESS)
+
     ap.add_argument("--metric", default="bleu", help="Metric to optimise; reads this key or eval_/val_ variants from history.json")
     ap.add_argument("--direction", choices=["auto", "min", "max"], default="auto")
     ap.add_argument("--seed", type=int, default=42)
@@ -364,8 +509,14 @@ def main() -> None:
     ap.add_argument("--force", action="store_true", help="rerun even if an expected model/checkpoint already exists")
 
     args = ap.parse_args()
+
+    if args.top_k is not None:
+        args.beam_width = args.top_k
+    if args.random_starts is not None and args.initial_candidates is None:
+        args.initial_candidates = args.random_starts
+
     rng = random.Random(args.seed)
-    direction = metric_direction(args.metric, None if args.direction == "auto" else args.direction)
+    direction = metric_direction(args.metric, "auto" if args.direction == "auto" else args.direction)
 
     fixed = dict(parse_kv(x) for x in args.set)
     space: Dict[str, List[str]] = {}
@@ -377,115 +528,85 @@ def main() -> None:
         space[key] = vals
 
     if not space:
-        raise ValueError("Dynamic search needs at least one --values or --range argument.")
+        raise ValueError("Beam search needs at least one --values or --range argument.")
+    if args.beam_width <= 0:
+        raise ValueError("--beam-width must be > 0")
+    if args.expand_per_parent <= 0:
+        raise ValueError("--expand-per-parent must be > 0")
+    if args.generations <= 0:
+        raise ValueError("--generations must be > 0")
+
+    initial_n = args.initial_candidates or args.beam_width * args.expand_per_parent
 
     study_dir = Path(args.study_dir) if args.study_dir else Path(args.save_template.split("{")[0] or ".").parent
     study_dir.mkdir(parents=True, exist_ok=True)
-    study_log = study_dir / "dynamic_search.jsonl"
+    study_log = study_dir / "dynamic_beam_search.jsonl"
 
     completed: List[Dict[str, Any]] = []
-    tried = set()
-    successful = 0
-    failed: List[Tuple[str, str, str, str]] = []
-    skipped = 0
-    planned = 0
+    beam: List[Dict[str, Any]] = []
+    tried: Set[Tuple[Tuple[str, str], ...]] = set()
+    global_trial = 0
 
-    for trial in range(1, args.trials + 1):
-        candidate = propose_params(
-            fixed=fixed,
-            space=space,
-            completed=completed,
-            tried=tried,
-            random_starts=args.random_starts,
-            top_k=args.top_k,
-            mutation_rate=args.mutation_rate,
-            rng=rng,
-        )
-        if candidate is None:
-            print("No untried candidate left in the supplied search space.")
+    for generation in range(1, args.generations + 1):
+        if generation == 1 or not beam:
+            candidates = initial_candidates(
+                fixed=fixed,
+                space=space,
+                n=initial_n,
+                rng=rng,
+                tried=tried,
+            )
+        else:
+            candidates = expand_beam(
+                beam=beam,
+                fixed=fixed,
+                space=space,
+                expand_per_parent=args.expand_per_parent,
+                rng=rng,
+                tried=tried,
+                random_fraction=args.random_fraction,
+            )
+
+        if not candidates:
+            print("No untried candidates left in the supplied search space.")
             break
 
-        tried.add(params_id(candidate, space.keys()))
-        params = dict(candidate)
-        apply_templates(params, args.save_template, args.out_template)
+        print(f"\n### Generation {generation}/{args.generations}: {len(candidates)} candidate(s) ###")
 
-        run_base = Path(str(params.get("run_dir", params.get("save"))))
-        run_base.mkdir(parents=True, exist_ok=True)
-        wrapper_log = run_base / "wrapper.log"
-        stdout_file = Path(str(params.get("log_file", run_base / "stdout.log")))
-        history_file = Path(str(params.get("history_json", run_base / "history.json")))
+        for trial_in_generation, candidate in enumerate(candidates, start=1):
+            global_trial += 1
+            record = run_candidate(
+                params_in=candidate,
+                args=args,
+                generation=generation,
+                trial_in_generation=trial_in_generation,
+                global_trial=global_trial,
+                direction=direction,
+                study_log=study_log,
+            )
+            if record is not None:
+                completed.append(record)
+                completed = rank_completed(completed, direction)
+                best = completed[0]
+                print(f"Current best: {args.metric}={best['score']} at {best['run_base']}")
 
-        cmd = build_command(args.python, args.mtat, args.command, params)
-        printable = " ".join(shlex.quote(x) for x in cmd)
+        completed = rank_completed(completed, direction)
+        beam = completed[: args.beam_width]
 
-        print(f"\n=== Trial {trial}/{args.trials} ===")
-        print(printable)
-        append_log(wrapper_log, f"START trial={trial}: {printable}")
-
-        event: Dict[str, Any] = {
-            "timestamp": timestamp(),
-            "trial": trial,
-            "params": params,
-            "command": printable,
-            "metric": args.metric,
-            "direction": direction,
-        }
-
-        if not args.force and model_exists(params, run_base):
-            skipped += 1
-            score = read_best_score(history_file, args.metric, direction)
-            event.update({"status": "skipped_existing", "score": score})
-            print(f"SKIP: model/checkpoint exists: {run_base}")
-            if score is not None:
-                completed.append({"score": score, "params": candidate, "run_base": str(run_base)})
-                completed.sort(key=lambda x: x["score"], reverse=(direction == "max"))
-        elif args.execute:
-            with open(stdout_file, "w", encoding="utf-8") as log:
-                proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, text=True, env=os.environ.copy())
-
-            if proc.returncode != 0:
-                reason = classify_failure(proc.returncode, stdout_file)
-                event.update({"status": "failed", "reason": reason})
-                append_log(wrapper_log, f"FAILED: {reason}")
-                failed.append((printable, str(stdout_file), str(wrapper_log), reason))
-                print(f"FAILED: {reason}")
-            elif not model_exists(params, run_base):
-                reason = "command returned 0 but no expected model/checkpoint was found"
-                event.update({"status": "failed", "reason": reason})
-                append_log(wrapper_log, f"FAILED: {reason}")
-                failed.append((printable, str(stdout_file), str(wrapper_log), reason))
-                print(f"FAILED: {reason}")
-            else:
-                score = read_best_score(history_file, args.metric, direction)
-                successful += 1
-                event.update({"status": "success", "score": score})
-                append_log(wrapper_log, f"SUCCESS: score={score}")
-                print(f"SUCCESS: {args.metric}={score}")
-                if score is not None:
-                    completed.append({"score": score, "params": candidate, "run_base": str(run_base)})
-                    completed.sort(key=lambda x: x["score"], reverse=(direction == "max"))
+        print(f"\n--- Beam after generation {generation} ---")
+        if not beam:
+            print("No scored successful/skipped runs yet; next generation will sample randomly.")
         else:
-            planned += 1
-            event.update({"status": "planned"})
+            for i, item in enumerate(beam, start=1):
+                print(f"{i}. {args.metric}={item['score']} at {item['run_base']}")
 
-        with open(study_log, "a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
-
-        if completed:
-            best = completed[0]
-            print(f"Current best: {args.metric}={best['score']} at {best['run_base']}")
-
-    print(f"\nFinished. Successful runs: {successful}. Failed runs: {len(failed)}. Skipped runs: {skipped}. Planned-only runs: {planned}.")
+    print(f"\nFinished. Total attempted/planned trials: {global_trial}.")
     print(f"Study log: {study_log}")
     if completed:
-        best = completed[0]
+        best = rank_completed(completed, direction)[0]
         print(f"Best observed {args.metric}: {best['score']} at {best['run_base']}")
-
-    for cmd_text, log_file, wrapper_log, reason in failed:
-        print(f"\nFAILED: {cmd_text}")
-        print(f"Reason: {reason}")
-        print(f"Log: {log_file}")
-        print(f"Wrapper log: {wrapper_log}")
+    else:
+        print("No successful scored run was observed.")
 
 
 if __name__ == "__main__":
