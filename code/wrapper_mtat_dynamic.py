@@ -446,25 +446,25 @@ def run_candidate(
             completed_record = {"score": score, "params": params_in, "run_base": str(run_base)}
     elif args.execute:
         with open(stdout_file, "w", encoding="utf-8") as log:
-            proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, text=True, env=os.environ.copy())
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=os.environ.copy(),
+            )
 
-        if proc.returncode != 0:
-            reason = classify_failure(proc.returncode, stdout_file)
-            event.update({"status": "failed", "reason": reason})
-            append_log(wrapper_log, f"FAILED: {reason}")
-            print(f"FAILED: {reason}")
-        elif not model_exists(params, run_base):
-            reason = "command returned 0 but no expected model/checkpoint was found"
-            event.update({"status": "failed", "reason": reason})
-            append_log(wrapper_log, f"FAILED: {reason}")
-            print(f"FAILED: {reason}")
-        else:
-            score = read_best_score(history_file, args.metric, direction)
-            event.update({"status": "success", "score": score})
-            append_log(wrapper_log, f"SUCCESS: score={score}")
-            print(f"SUCCESS: {args.metric}={score}")
-            if score is not None:
-                completed_record = {"score": score, "params": params_in, "run_base": str(run_base)}
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                print(line, end="", flush=True)
+                log.write(line)
+                log.flush()
+
+            returncode = proc.wait()
+
+        if returncode != 0:
+            reason = classify_failure(returncode, stdout_file)
     else:
         event.update({"status": "planned"})
 
