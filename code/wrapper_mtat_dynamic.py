@@ -445,26 +445,41 @@ def run_candidate(
         if score is not None:
             completed_record = {"score": score, "params": params_in, "run_base": str(run_base)}
     elif args.execute:
-        with open(stdout_file, "w", encoding="utf-8") as log:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                env=os.environ.copy(),
-            )
+        cmd_str = " ".join(shlex.quote(x) for x in cmd)
 
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                print(line, end="", flush=True)
-                log.write(line)
-                log.flush()
+        tee_cmd = (
+            f"set -o pipefail; "
+            f"{cmd_str} 2>&1 | tee {shlex.quote(str(stdout_file))}"
+        )
 
-            returncode = proc.wait()
+        proc = subprocess.run(
+            ["bash", "-c", tee_cmd],
+            env=os.environ.copy(),
+        )
+
+        returncode = proc.returncode
 
         if returncode != 0:
             reason = classify_failure(returncode, stdout_file)
+            event.update({"status": "failed", "reason": reason})
+            append_log(wrapper_log, f"FAILED: {reason}")
+            print(f"FAILED: {reason}")
+        elif not model_exists(params, run_base):
+            reason = "command returned 0 but no expected model/checkpoint was found"
+            event.update({"status": "failed", "reason": reason})
+            append_log(wrapper_log, f"FAILED: {reason}")
+            print(f"FAILED: {reason}")
+        else:
+            score = read_best_score(history_file, args.metric, direction)
+            event.update({"status": "success", "score": score})
+            append_log(wrapper_log, f"SUCCESS: score={score}")
+            print(f"SUCCESS: {args.metric}={score}")
+            if score is not None:
+                completed_record = {
+                    "score": score,
+                    "params": params_in,
+                    "run_base": str(run_base),
+                }
     else:
         event.update({"status": "planned"})
 
