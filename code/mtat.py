@@ -1707,7 +1707,7 @@ class Seq2SeqRNN(nn.Module):
             dtype=torch.long,
             device=src.device,
         )
-        dec_hidden = enc_hidden
+        dec_hidden = self.match_decoder_layers(enc_hidden)
         outputs: List[torch.Tensor] = []
 
         for t in range(tgt.size(1)):
@@ -1738,7 +1738,7 @@ class Seq2SeqRNN(nn.Module):
         encoder_outputs, enc_hidden = self.encoder(src)
         src_mask = self.make_src_mask(src)
         dec_input = torch.full((1,), self.tgt_sos_idx, dtype=torch.long, device=src.device)
-        dec_hidden = enc_hidden
+        dec_hidden = self.match_decoder_layers(enc_hidden)
         hyp_ids: List[int] = []
         attn_list: List[torch.Tensor] = []
 
@@ -1792,7 +1792,7 @@ class Seq2SeqRNN(nn.Module):
             dtype=torch.long,
             device=src.device,
         )
-        dec_hidden = enc_hidden
+        dec_hidden = self.match_decoder_layers(enc_hidden)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=src.device)
         hyp_ids: List[List[int]] = [[] for _ in range(batch_size)]
         attn_steps: List[torch.Tensor] = []
@@ -1830,7 +1830,23 @@ class Seq2SeqRNN(nn.Module):
                 attn_matrices[i] = stacked[: len(hyp_ids[i]), i, :]
 
         return hyp_ids, attn_matrices
+    def match_decoder_layers(self, hidden):
+        target_layers = self.decoder.rnn.num_layers
 
+        def fix(h):
+            current_layers = h.size(0)
+            if current_layers == target_layers:
+                return h
+            if current_layers > target_layers:
+                return h[-target_layers:]
+            extra = h[-1:].repeat(target_layers - current_layers, 1, 1)
+            return torch.cat([h, extra], dim=0)
+
+        if isinstance(hidden, tuple):  # LSTM: (h, c)
+            h, c = hidden
+            return fix(h), fix(c)
+
+        return fix(hidden) 
 
 def set_rnn_seed(seed: int) -> None:
     """Set random seeds for the custom PyTorch RNN path."""
