@@ -3495,6 +3495,8 @@ def main() -> None:
     args = parse_args_with_optional_config(parser)
 
     if args.command == "finetune":
+        if args.lr is None:
+            args.lr = get_default_learning_rate(args.model_type)
         if args.model_type == "rnn":
             finetune_rnn_seq2seq(args)
             return
@@ -3503,9 +3505,7 @@ def main() -> None:
             return
         if not args.pretrained_model:
             raise ValueError("--pretrained-model is required for Hugging Face pretrained model types")
-        if args.lr is None:
-            args.lr = get_default_learning_rate(args.model_type)
-    
+        
         finetune_hf_seq2seq(args)
         return
 
