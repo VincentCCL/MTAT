@@ -47,6 +47,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import csv
+import sys
+
+csv.field_size_limit(sys.maxsize)
 
 ARGPARSE_MARKERS = (
     "usage:",
