@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import csv
 import sys
+import re
 
 csv.field_size_limit(sys.maxsize)
 
@@ -343,6 +344,14 @@ def mutate_one_or_more(parent: Dict[str, Any], space: Dict[str, List[str]], rng:
         child[key] = rng.choice(options)
     return child
 
+def read_num_params(stdout_file: Path) -> Optional[int]:
+    if not stdout_file.exists():
+        return None
+    text = stdout_file.read_text(encoding="utf-8", errors="ignore")
+    m = re.search(r"Total trainable parameters:\s*([0-9,]+)", text)
+    if not m:
+        return None
+    return int(m.group(1).replace(",", ""))
 
 def initial_candidates(
     fixed: Dict[str, str],
@@ -569,17 +578,18 @@ def run_candidate(
         "global_trial": global_trial,
         "status": event.get("status"),
         "reason": event.get("reason"),
-        "optim_metric": args.metric,
-        "optim_direction": direction,
+        #"optim_metric": args.metric,
+        #"optim_direction": direction,
         "score": event.get("score", best_score),
         "run_dir": str(run_base),
-        "stdout_log": str(stdout_file),
-        "wrapper_log": str(wrapper_log),
-        "history_json": str(history_file),
+        #"stdout_log": str(stdout_file),
+        #"wrapper_log": str(wrapper_log),
+        #"history_json": str(history_file),
         "command": printable,
+        "num_params": read_num_params(stdout_file),
     }
-
-    tsv_row.update({f"param_{k}": v for k, v in params_in.items()})
+    # Only include parameters that are part of the search space.
+    tsv_row.update({k: params_in.get(k) for k in args.search_keys})
 
     if best_row:
         tsv_row["best_epoch"] = best_row.get("epoch")
@@ -653,7 +663,7 @@ def main() -> None:
         raise ValueError("--generations must be > 0")
 
     initial_n = args.initial_candidates or args.beam_width * args.expand_per_parent
-
+    args.search_keys = sorted(space.keys())
     study_dir = Path(args.study_dir) if args.study_dir else Path(args.save_template.split("{")[0] or ".").parent
     study_dir.mkdir(parents=True, exist_ok=True)
     study_log = study_dir / "dynamic_beam_search.jsonl"
