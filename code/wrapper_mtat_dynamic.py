@@ -46,6 +46,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+import csv
 
 ARGPARSE_MARKERS = (
     "usage:",
@@ -221,7 +222,77 @@ def read_best_score(history_json: Path, metric: str, direction: str) -> Optional
         return None
     return min(values) if direction == "min" else max(values)
 
+def numeric_records_from_history(history_json: Path) -> List[Dict[str, Any]]:
+    if not history_json.exists():
+        return []
+    try:
+        history = json.loads(history_json.read_text(encoding="utf-8"))
+    except Exception:
+        return []
 
+    if isinstance(history, dict):
+        for key in ("history", "log_history", "records", "epochs"):
+            if isinstance(history.get(key), list):
+                history = history[key]
+                break
+
+    if not isinstance(history, list):
+        return []
+
+    rows = []
+    for rec in history:
+        if isinstance(rec, dict):
+            rows.append({
+                k: v for k, v in rec.items()
+                if isinstance(v, (int, float, str, bool)) or v is None
+            })
+    return rows
+
+
+def best_record_from_history(history_json: Path, metric: str, direction: str) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
+    rows = numeric_records_from_history(history_json)
+    best_row = None
+    best_score = None
+
+    for row in rows:
+        score = metric_from_record(row, metric)
+        if score is None:
+            continue
+        if best_score is None or (direction == "max" and score > best_score) or (direction == "min" and score < best_score):
+            best_score = score
+            best_row = row
+
+    return best_row, best_score
+
+
+def append_tsv_row(path: Path, row: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing_fields = []
+    if path.exists():
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            first = f.readline().rstrip("\n")
+            if first:
+                existing_fields = first.split("\t")
+
+    fields = list(existing_fields)
+    for key in row.keys():
+        if key not in fields:
+            fields.append(key)
+
+    rows = []
+    if path.exists() and existing_fields != fields:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            rows = list(reader)
+
+    rows.append({k: "" if v is None else v for k, v in row.items()})
+
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, delimiter="\t", extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+        
 def score_sort_key(item: Dict[str, Any], direction: str) -> float:
     score = item.get("score")
     if score is None:
@@ -416,7 +487,7 @@ def run_candidate(
     wrapper_log = run_base / "wrapper.log"
     stdout_file = Path(str(params.get("log_file", run_base / "stdout.log")))
     history_file = Path(str(params.get("history_json", run_base / "history.json")))
-
+    results_tsv = study_log.parent / "beam_results.tsv"
     cmd = build_command(args.python, args.mtat, args.command, params)
     printable = " ".join(shlex.quote(x) for x in cmd)
 
@@ -486,6 +557,33 @@ def run_candidate(
     with open(study_log, "a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
+    best_row, best_score = best_record_from_history(history_file, args.metric, direction)
+
+    tsv_row = {
+        "timestamp": event["timestamp"],
+        "generation": generation,
+        "trial_in_generation": trial_in_generation,
+        "global_trial": global_trial,
+        "status": event.get("status"),
+        "reason": event.get("reason"),
+        "optim_metric": args.metric,
+        "optim_direction": direction,
+        "score": event.get("score", best_score),
+        "run_dir": str(run_base),
+        "stdout_log": str(stdout_file),
+        "wrapper_log": str(wrapper_log),
+        "history_json": str(history_file),
+        "command": printable,
+    }
+
+    tsv_row.update({f"param_{k}": v for k, v in params_in.items()})
+
+    if best_row:
+        tsv_row["best_epoch"] = best_row.get("epoch")
+        for k, v in best_row.items():
+            tsv_row[f"metric_{k}"] = v
+
+    append_tsv_row(results_tsv, tsv_row)
     return completed_record
 
 
