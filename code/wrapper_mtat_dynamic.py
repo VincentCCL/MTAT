@@ -48,7 +48,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import csv
 import sys
-import re
 
 csv.field_size_limit(sys.maxsize)
 
@@ -268,34 +267,65 @@ def best_record_from_history(history_json: Path, metric: str, direction: str) ->
 
     return best_row, best_score
 
+TSV_FIELDS = [
+    "timestamp",
+    "generation",
+    "trial_in_generation",
+    "global_trial",
+    "status",
+    "reason",
+    "optim_metric",
+    "optim_direction",
+    "score",
+    "best_epoch",
+    "run_dir",
+    "stdout_log",
+    "wrapper_log",
+    "history_json",
+    "param_rnn_type",
+    "param_emb_size",
+    "param_enc_layers",
+    "param_dec_layers",
+    "param_hidden_size",
+    "param_bidirectional",
+    "param_attention",
+    "param_batch_size",
+    "param_subword_type",
+    "param_max_len",
+    "param_max_src_vocab",
+    "param_max_tgt_vocab",
+    "metric_loss",
+    "metric_nll",
+    "metric_val_nll",
+    "metric_bleu",
+    "metric_chrf",
+    "metric_ter",
+]
 
 def append_tsv_row(path: Path, row: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    existing_fields = []
-    if path.exists():
-        with open(path, "r", encoding="utf-8", newline="") as f:
-            first = f.readline().rstrip("\n")
-            if first:
-                existing_fields = first.split("\t")
+    file_exists = path.exists() and path.stat().st_size > 0
 
-    fields = list(existing_fields)
-    for key in row.keys():
-        if key not in fields:
-            fields.append(key)
+    clean_row = {
+        field: "" if row.get(field) is None else str(row.get(field, ""))
+        for field in TSV_FIELDS
+    }
 
-    rows = []
-    if path.exists() and existing_fields != fields:
-        with open(path, "r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f, delimiter="\t")
-            rows = list(reader)
+    with open(path, "a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=TSV_FIELDS,
+            delimiter="\t",
+            lineterminator="\n",
+            extrasaction="ignore",
+            quoting=csv.QUOTE_MINIMAL,
+        )
 
-    rows.append({k: "" if v is None else v for k, v in row.items()})
+        if not file_exists:
+            writer.writeheader()
 
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, delimiter="\t", extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
+        writer.writerow(clean_row)
         
 def score_sort_key(item: Dict[str, Any], direction: str) -> float:
     score = item.get("score")
@@ -344,14 +374,6 @@ def mutate_one_or_more(parent: Dict[str, Any], space: Dict[str, List[str]], rng:
         child[key] = rng.choice(options)
     return child
 
-def read_num_params(stdout_file: Path) -> Optional[int]:
-    if not stdout_file.exists():
-        return None
-    text = stdout_file.read_text(encoding="utf-8", errors="ignore")
-    m = re.search(r"Total trainable parameters:\s*([0-9,]+)", text)
-    if not m:
-        return None
-    return int(m.group(1).replace(",", ""))
 
 def initial_candidates(
     fixed: Dict[str, str],
@@ -578,23 +600,40 @@ def run_candidate(
         "global_trial": global_trial,
         "status": event.get("status"),
         "reason": event.get("reason"),
-        #"optim_metric": args.metric,
-        #"optim_direction": direction,
+        "optim_metric": args.metric,
+        "optim_direction": direction,
         "score": event.get("score", best_score),
         "run_dir": str(run_base),
-        #"stdout_log": str(stdout_file),
-        #"wrapper_log": str(wrapper_log),
-        #"history_json": str(history_file),
+        "stdout_log": str(stdout_file),
+        "wrapper_log": str(wrapper_log),
+        "history_json": str(history_file),
         "command": printable,
-        "num_params": read_num_params(stdout_file),
     }
-    # Only include parameters that are part of the search space.
-    tsv_row.update({k: params_in.get(k) for k in args.search_keys})
+
+    tsv_row.update({f"param_{k}": v for k, v in params_in.items()})
+
+    ESSENTIAL_METRICS = {
+        "epoch",
+        "step",
+        "loss",
+        "train_loss",
+        "eval_loss",
+        "val_loss",
+        "nll",
+        "val_nll",
+        "bleu",
+        "eval_bleu",
+        "chrf",
+        "eval_chrf",
+        "ter",
+        "eval_ter",
+    }
 
     if best_row:
         tsv_row["best_epoch"] = best_row.get("epoch")
-        for k, v in best_row.items():
-            tsv_row[f"metric_{k}"] = v
+        for k in ESSENTIAL_METRICS:
+            if k in best_row:
+                tsv_row[f"metric_{k}"] = best_row[k]
 
     append_tsv_row(results_tsv, tsv_row)
     return completed_record
@@ -663,7 +702,7 @@ def main() -> None:
         raise ValueError("--generations must be > 0")
 
     initial_n = args.initial_candidates or args.beam_width * args.expand_per_parent
-    args.search_keys = sorted(space.keys())
+
     study_dir = Path(args.study_dir) if args.study_dir else Path(args.save_template.split("{")[0] or ".").parent
     study_dir.mkdir(parents=True, exist_ok=True)
     study_log = study_dir / "dynamic_beam_search.jsonl"
