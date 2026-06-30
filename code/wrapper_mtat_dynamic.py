@@ -278,6 +278,13 @@ TSV_FIELDS = [
     "optim_direction",
     "score",
     "best_epoch",
+    "parent_generation",
+    "parent_trial",
+    "parent_global_trial",
+    "parent_score",
+    "parent_run_dir",
+    "mutated_param",
+    "child_distance",
     "run_dir",
     "stdout_log",
     "wrapper_log",
@@ -363,16 +370,35 @@ def neighbor_values(values: List[str], current: str, rng: random.Random) -> List
     return [v for v in values if v != current] or values
 
 
-def mutate_one_or_more(parent: Dict[str, Any], space: Dict[str, List[str]], rng: random.Random, max_changes: int = 2) -> Dict[str, str]:
+def mutate_one_or_more(
+    parent: Dict[str, Any],
+    space: Dict[str, List[str]],
+    rng: random.Random,
+    max_changes: int = 1,
+) -> Tuple[Dict[str, str], List[str]]:
+    """Return a child configuration and the search-space keys that changed.
+
+    The default is deliberately one change. This makes each non-initial
+    candidate interpretable as a single-step neighbour of its parent.
+    """
     child = {key: str(parent.get(key, rng.choice(values))) for key, values in space.items()}
     keys = list(space.keys())
     rng.shuffle(keys)
-    n_changes = rng.randint(1, max(1, min(max_changes, len(keys))))
-    for key in keys[:n_changes]:
+    n_changes = max(1, min(max_changes, len(keys)))
+    changed: List[str] = []
+
+    for key in keys:
+        if len(changed) >= n_changes:
+            break
         current = child[key]
         options = neighbor_values(space[key], current, rng)
-        child[key] = rng.choice(options)
-    return child
+        new_value = rng.choice(options)
+        if str(new_value) == str(current):
+            continue
+        child[key] = new_value
+        changed.append(key)
+
+    return child, changed
 
 
 def initial_candidates(
@@ -393,7 +419,12 @@ def initial_candidates(
         pid = params_id(candidate, search_keys)
         if pid not in tried:
             tried.add(pid)
-            out.append(candidate)
+            out.append({
+                "params": candidate,
+                "parent": None,
+                "mutated_param": "initial_random",
+                "child_distance": "",
+            })
     return out
 
 
@@ -404,7 +435,7 @@ def expand_beam(
     expand_per_parent: int,
     rng: random.Random,
     tried: Set[Tuple[Tuple[str, str], ...]],
-    random_fraction: float = 0.20,
+    random_fraction: float = 0.0,
     max_attempts: int = 10000,
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -414,12 +445,22 @@ def expand_beam(
 
     while len(out) < target and attempts < max_attempts:
         attempts += 1
+
+        # Optional exploration mode. By default random_fraction is 0.0, so
+        # generations after the initial generation are pure beam expansions.
         if not beam or rng.random() < random_fraction:
             dynamic = choose_random(space, rng)
+            parent_record = None
+            mutated_keys = ["random"]
+            child_distance = ""
         else:
-            parent_record = rng.choice(beam)
+            # Expand beam parents in score order. The first expand_per_parent
+            # children are therefore generated from the current best parent.
+            parent_index = min(len(beam) - 1, len(out) // max(1, expand_per_parent))
+            parent_record = beam[parent_index]
             parent = parent_record["params"]
-            dynamic = mutate_one_or_more(parent, space, rng)
+            dynamic, mutated_keys = mutate_one_or_more(parent, space, rng, max_changes=1)
+            child_distance = len(mutated_keys)
 
         candidate = dict(fixed)
         candidate.update(dynamic)
@@ -427,7 +468,12 @@ def expand_beam(
         if pid in tried:
             continue
         tried.add(pid)
-        out.append(candidate)
+        out.append({
+            "params": candidate,
+            "parent": parent_record,
+            "mutated_param": ",".join(mutated_keys),
+            "child_distance": child_distance,
+        })
     return out
 
 
@@ -512,6 +558,9 @@ def run_candidate(
     global_trial: int,
     direction: str,
     study_log: Path,
+    parent_record: Optional[Dict[str, Any]] = None,
+    mutated_param: str = "",
+    child_distance: Any = "",
 ) -> Optional[Dict[str, Any]]:
     params = dict(params_in)
     apply_templates(params, args.save_template, args.out_template)
@@ -539,6 +588,13 @@ def run_candidate(
         "command": printable,
         "metric": args.metric,
         "direction": direction,
+        "parent_generation": None if parent_record is None else parent_record.get("generation"),
+        "parent_trial": None if parent_record is None else parent_record.get("trial_in_generation"),
+        "parent_global_trial": None if parent_record is None else parent_record.get("global_trial"),
+        "parent_score": None if parent_record is None else parent_record.get("score"),
+        "parent_run_dir": None if parent_record is None else parent_record.get("run_base"),
+        "mutated_param": mutated_param,
+        "child_distance": child_distance,
     }
 
     completed_record: Optional[Dict[str, Any]] = None
@@ -548,7 +604,14 @@ def run_candidate(
         event.update({"status": "skipped_existing", "score": score})
         print(f"SKIP: model/checkpoint exists: {run_base}")
         if score is not None:
-            completed_record = {"score": score, "params": params_in, "run_base": str(run_base)}
+            completed_record = {
+                "score": score,
+                "params": params_in,
+                "run_base": str(run_base),
+                "generation": generation,
+                "trial_in_generation": trial_in_generation,
+                "global_trial": global_trial,
+            }
     elif args.execute:
         cmd_str = " ".join(shlex.quote(x) for x in cmd)
 
@@ -584,6 +647,9 @@ def run_candidate(
                     "score": score,
                     "params": params_in,
                     "run_base": str(run_base),
+                    "generation": generation,
+                    "trial_in_generation": trial_in_generation,
+                    "global_trial": global_trial,
                 }
     else:
         event.update({"status": "planned"})
@@ -603,6 +669,13 @@ def run_candidate(
         "optim_metric": args.metric,
         "optim_direction": direction,
         "score": event.get("score", best_score),
+        "parent_generation": event.get("parent_generation"),
+        "parent_trial": event.get("parent_trial"),
+        "parent_global_trial": event.get("parent_global_trial"),
+        "parent_score": event.get("parent_score"),
+        "parent_run_dir": event.get("parent_run_dir"),
+        "mutated_param": event.get("mutated_param"),
+        "child_distance": event.get("child_distance"),
         "run_dir": str(run_base),
         "stdout_log": str(stdout_file),
         "wrapper_log": str(wrapper_log),
@@ -658,7 +731,12 @@ def main() -> None:
     ap.add_argument("--beam-width", type=int, default=5, help="Number of best configs kept after each generation")
     ap.add_argument("--expand-per-parent", type=int, default=3, help="Candidates generated per beam item")
     ap.add_argument("--initial-candidates", type=int, default=None, help="Generation-1 candidates; default beam_width * expand_per_parent")
-    ap.add_argument("--random-fraction", type=float, default=0.20, help="Fraction of candidates sampled fully randomly after generation 1")
+    ap.add_argument(
+        "--random-fraction",
+        type=float,
+        default=0.0,
+        help="Fraction of candidates sampled fully randomly after generation 1; default 0 for pure beam expansion",
+    )
 
     # Backwards-compatible dynamic-wrapper aliases. They are accepted, but beam args are preferred.
     ap.add_argument("--trials", type=int, default=None, help=argparse.SUPPRESS)
@@ -738,16 +816,19 @@ def main() -> None:
 
         print(f"\n### Generation {generation}/{args.generations}: {len(candidates)} candidate(s) ###")
 
-        for trial_in_generation, candidate in enumerate(candidates, start=1):
+        for trial_in_generation, candidate_info in enumerate(candidates, start=1):
             global_trial += 1
             record = run_candidate(
-                params_in=candidate,
+                params_in=candidate_info["params"],
                 args=args,
                 generation=generation,
                 trial_in_generation=trial_in_generation,
                 global_trial=global_trial,
                 direction=direction,
                 study_log=study_log,
+                parent_record=candidate_info.get("parent"),
+                mutated_param=str(candidate_info.get("mutated_param", "")),
+                child_distance=candidate_info.get("child_distance", ""),
             )
             if record is not None:
                 completed.append(record)
