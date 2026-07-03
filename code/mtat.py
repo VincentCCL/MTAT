@@ -2539,8 +2539,8 @@ class ScratchTransformerSeq2Seq(nn.Module):
         self.src_pad_idx = src_pad_idx
         self.tgt_pad_idx = tgt_pad_idx
         self.d_model = d_model
-        self.max_len = max_len
-
+        self.max_len = max_position
+        self.max_position = max_position
         self.src_embedding = nn.Embedding(src_vocab_size, d_model, padding_idx=src_pad_idx)
         self.tgt_embedding = nn.Embedding(tgt_vocab_size, d_model, padding_idx=tgt_pad_idx)
         self.positional_encoding = PositionalEncoding(
@@ -2572,12 +2572,11 @@ class ScratchTransformerSeq2Seq(nn.Module):
                 f"--max-position={self.max_position}."
             )
 
-        if tgt.size(1) > self.max_position:
+        if tgt_input.size(1) > self.max_position:
             raise ValueError(
                 f"Target sequence length {tgt.size(1)} exceeds "
                 f"--max-position={self.max_position}."
             )
-        self.max_position = max_position
         src_emb = self.positional_encoding(self.src_embedding(src) * math.sqrt(self.d_model))
         tgt_emb = self.positional_encoding(self.tgt_embedding(tgt_input) * math.sqrt(self.d_model))
         hidden = self.transformer(
@@ -2656,7 +2655,7 @@ def build_scratch_transformer_model(
         num_decoder_layers=int(model_args.get("num_decoder_layers", 3)),
         dim_feedforward=int(model_args.get("dim_feedforward", 1024)),
         dropout=float(model_args.get("dropout", 0.1)),
-        max_len=int(model_args.get("max_len", 256)),
+        max_position=int(model_args.get("max_position", 512))
     ).to(device)
 
 
