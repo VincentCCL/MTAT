@@ -2842,11 +2842,11 @@ def finetune_scratch_transformer(args: argparse.Namespace) -> None:
         tgt_vocab = build_vocab([tgt for _, tgt in train_pairs_tok], max_size=args.max_tgt_vocab)
         model_args = {
             "model_type": "transformer-scratch",
-            "d_model": args.d_model,
-            "nhead": args.nhead,
-            "num_encoder_layers": args.transformer_enc_layers,
-            "num_decoder_layers": args.transformer_dec_layers,
-            "dim_feedforward": args.dim_feedforward,
+            "d_model": args.hidden_size,
+            "nhead": args.heads,
+            "num_encoder_layers": args.enc_layers,
+            "num_decoder_layers": args.dec_layers,
+            "dim_feedforward": args.ff_size,
             "dropout": args.dropout,
             "max_len": args.max_len,
             "subword_type": args.subword_type,
@@ -3357,6 +3357,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ft.add_argument("--grad-accum", type=int, default=1)
     ft.add_argument("--fp16", action="store_true")
     ft.add_argument("--seed", type=int, default=42)
+    ft.add_argument("--heads", type=int, default=4, help="Transformer attention heads")
+    ft.add_argument("--ff-size", type=int, default=1024, help="Transformer feed-forward size")
 
     ft.add_argument("--batch-size", type=int, default=8)
     ft.add_argument("--eval-batch-size", type=int, default=None)
@@ -3436,11 +3438,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ft.add_argument("--early-stopping", type=int, default=0, help="RNN patience in epochs; 0 disables")
     ft.add_argument("--early-metric", choices=["loss", "bleu", "chrf", "ter"], default="loss")
     ft.add_argument("--replace-unk", action="store_true", help="RNN attention-based <unk> replacement")
-    ft.add_argument("--d-model", type=int, default=256, help="Scratch Transformer embedding/hidden size")
-    ft.add_argument("--nhead", type=int, default=4, help="Scratch Transformer attention heads")
-    ft.add_argument("--transformer-enc-layers", type=int, default=3, help="Scratch Transformer encoder layers")
-    ft.add_argument("--transformer-dec-layers", type=int, default=3, help="Scratch Transformer decoder layers")
-    ft.add_argument("--dim-feedforward", type=int, default=1024, help="Scratch Transformer feed-forward size")
+    #ft.add_argument("--d-model", type=int, default=256, help="Scratch Transformer embedding/hidden size")
+    #ft.add_argument("--nhead", type=int, default=4, help="Scratch Transformer attention heads")
+    #ft.add_argument("--transformer-enc-layers", type=int, default=3, help="Scratch Transformer encoder layers")
+    #ft.add_argument("--transformer-dec-layers", type=int, default=3, help="Scratch Transformer decoder layers")
+    #ft.add_argument("--dim-feedforward", type=int, default=1024, help="Scratch Transformer feed-forward size")
     ft.add_argument("--dropout", type=float, default=0.1, help="Scratch Transformer dropout")
     ft.add_argument("--scratch-load", default=None, help="Scratch Transformer checkpoint to resume from")
     ft.add_argument("--scratch-save-best", default=None, help="Best scratch Transformer checkpoint path; default: <save>.best.pt")
