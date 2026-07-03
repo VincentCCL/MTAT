@@ -2555,6 +2555,7 @@ class ScratchTransformerSeq2Seq(nn.Module):
             dim_feedforward=dim_feedforward,
             dropout=dropout,
             batch_first=True,
+            enable_nested_tensor=False,
         )
         self.output_projection = nn.Linear(d_model, tgt_vocab_size)
 
