@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import csv
 import sys
-import yanml
+import yaml
 
 csv.field_size_limit(sys.maxsize)
 
