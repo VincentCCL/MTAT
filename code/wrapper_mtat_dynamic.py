@@ -801,6 +801,7 @@ def main() -> None:
         "save_template",
         "out_template",
         "study_dir",
+        "results_tsv",
         "generations",
         "beam_width",
         "expand_per_parent",
