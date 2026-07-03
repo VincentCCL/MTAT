@@ -289,18 +289,18 @@ TSV_FIELDS = [
     "stdout_log",
     "wrapper_log",
     "history_json",
-    "param_rnn_type",
-    "param_emb_size",
-    "param_enc_layers",
-    "param_dec_layers",
-    "param_hidden_size",
-    "param_bidirectional",
-    "param_attention",
-    "param_batch_size",
-    "param_subword_type",
-    "param_max_len",
-    "param_max_src_vocab",
-    "param_max_tgt_vocab",
+    "rnn_type",
+    "emb_size",
+    "enc_layers",
+    "dec_layers",
+    "hidden_size",
+    "bidirectional",
+    "attention",
+    "batch_size",
+    "subword_type",
+    "max_len",
+    "max_src_vocab",
+    "max_tgt_vocab",
     "metric_loss",
     "metric_nll",
     "metric_val_nll",
@@ -683,7 +683,7 @@ def run_candidate(
         "command": printable,
     }
 
-    tsv_row.update({f"param_{k}": v for k, v in params_in.items()})
+    tsv_row.update({f"{k}": v for k, v in params_in.items()})
 
     ESSENTIAL_METRICS = {
         "epoch",
