@@ -571,7 +571,11 @@ def run_candidate(
     wrapper_log = run_base / "wrapper.log"
     stdout_file = Path(str(params.get("log_file", run_base / "stdout.log")))
     history_file = Path(str(params.get("history_json", run_base / "history.json")))
-    results_tsv = study_log.parent / "beam_results.tsv"
+    results_tsv = (
+        Path(args.results_tsv)
+        if args.results_tsv
+        else study_log.parent / "beam_results.tsv"
+    )
     cmd = build_command(args.python, args.mtat, args.command, params)
     printable = " ".join(shlex.quote(x) for x in cmd)
 
@@ -777,7 +781,11 @@ def main() -> None:
 
     ap.add_argument("--execute", action="store_true")
     ap.add_argument("--force", action="store_true", help="rerun even if an expected model/checkpoint already exists")
-
+    ap.add_argument(
+       "--results-tsv",
+        default=None,
+        help="TSV file in which all trial results are stored."
+    )
     args = ap.parse_args()
     config = load_yaml_config(args.config)
 
