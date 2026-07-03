@@ -2271,7 +2271,10 @@ def finetune_rnn_seq2seq(args: argparse.Namespace) -> None:
     )
     val_loader = None
     if val_pairs_tok is not None:
-        val_dataset = RNNParallelDataset(val_pairs_tok, src_vocab, tgt_vocab, max_len=None)
+        val_dataset = RNNParallelDataset(val_pairs_tok, 
+                                         src_vocab, 
+                                         tgt_vocab, 
+                                         max_len=args.max_len)
         val_loader = DataLoader(
             val_dataset,
             batch_size=args.eval_batch_size or args.batch_size,
@@ -2530,7 +2533,7 @@ class ScratchTransformerSeq2Seq(nn.Module):
         num_decoder_layers: int = 3,
         dim_feedforward: int = 1024,
         dropout: float = 0.1,
-        max_len: int = 256,
+        max_position: int = 512,
     ) -> None:
         super().__init__()
         self.src_pad_idx = src_pad_idx
@@ -2540,7 +2543,10 @@ class ScratchTransformerSeq2Seq(nn.Module):
 
         self.src_embedding = nn.Embedding(src_vocab_size, d_model, padding_idx=src_pad_idx)
         self.tgt_embedding = nn.Embedding(tgt_vocab_size, d_model, padding_idx=tgt_pad_idx)
-        self.positional_encoding = PositionalEncoding(d_model, dropout=dropout, max_len=max_len + 5)
+        self.positional_encoding = PositionalEncoding(
+            d_model,
+            max_len=max_position,
+        )
         self.transformer = nn.Transformer(
             d_model=d_model,
             nhead=nhead,
@@ -2560,7 +2566,18 @@ class ScratchTransformerSeq2Seq(nn.Module):
         src_key_padding_mask = src == self.src_pad_idx
         tgt_key_padding_mask = tgt_input == self.tgt_pad_idx
         tgt_mask = self.make_tgt_mask(tgt_input.size(1), tgt_input.device)
+        if src.size(1) > self.max_position:
+            raise ValueError(
+                f"Input sequence length {src.size(1)} exceeds "
+                f"--max-position={self.max_position}."
+            )
 
+        if tgt.size(1) > self.max_position:
+            raise ValueError(
+                f"Target sequence length {tgt.size(1)} exceeds "
+                f"--max-position={self.max_position}."
+            )
+        self.max_position = max_position
         src_emb = self.positional_encoding(self.src_embedding(src) * math.sqrt(self.d_model))
         tgt_emb = self.positional_encoding(self.tgt_embedding(tgt_input) * math.sqrt(self.d_model))
         hidden = self.transformer(
@@ -2853,6 +2870,7 @@ def finetune_scratch_transformer(args: argparse.Namespace) -> None:
             "src_sp_model": args.src_sp_model,
             "tgt_sp_model": args.tgt_sp_model,
             "lower": args.lower,
+            "max_position": args.max_position,
         }
         model = build_scratch_transformer_model(src_vocab, tgt_vocab, model_args, device)
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -2871,7 +2889,10 @@ def finetune_scratch_transformer(args: argparse.Namespace) -> None:
     )
     val_loader = None
     if val_pairs_tok is not None:
-        val_dataset = RNNParallelDataset(val_pairs_tok, src_vocab, tgt_vocab, max_len=None)
+        val_dataset = RNNParallelDataset(val_pairs_tok, 
+                                         src_vocab, 
+                                         tgt_vocab, 
+                                         max_len=args.max_lene)
         val_loader = DataLoader(
             val_dataset,
             batch_size=args.eval_batch_size or args.batch_size,
@@ -3438,11 +3459,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ft.add_argument("--early-stopping", type=int, default=0, help="RNN patience in epochs; 0 disables")
     ft.add_argument("--early-metric", choices=["loss", "bleu", "chrf", "ter"], default="loss")
     ft.add_argument("--replace-unk", action="store_true", help="RNN attention-based <unk> replacement")
+    ft.add_argument("--max-position",
+                    type=int,
+                    default=512,
+                    help="Maximum position embedding size for scratch Transformer; must be >= max_len" \
+                    "Note: this is not the same as max_len, which is the maximum sentence length for training and generation.")
     #ft.add_argument("--d-model", type=int, default=256, help="Scratch Transformer embedding/hidden size")
     #ft.add_argument("--nhead", type=int, default=4, help="Scratch Transformer attention heads")
     #ft.add_argument("--transformer-enc-layers", type=int, default=3, help="Scratch Transformer encoder layers")
     #ft.add_argument("--transformer-dec-layers", type=int, default=3, help="Scratch Transformer decoder layers")
-    #ft.add_argument("--dim-feedforward", type=int, default=1024, help="Scratch Transformer feed-forward size")
+    ft.add_argument("--dim-feedforward", type=int, default=1024, help="Scratch Transformer feed-forward size")
     ft.add_argument("--dropout", type=float, default=0.1, help="Scratch Transformer dropout")
     ft.add_argument("--scratch-load", default=None, help="Scratch Transformer checkpoint to resume from")
     ft.add_argument("--scratch-save-best", default=None, help="Best scratch Transformer checkpoint path; default: <save>.best.pt")
