@@ -2556,15 +2556,6 @@ class ScratchTransformerSeq2Seq(nn.Module):
             dropout=dropout,
             batch_first=True,
         )
-        try:
-            self.transformer = nn.Transformer(
-                **transformer_kwargs,
-                enable_nested_tensor=False,
-            )
-        except TypeError:
-            self.transformer = nn.Transformer(
-                **transformer_kwargs,
-            )
         self.output_projection = nn.Linear(d_model, tgt_vocab_size)
 
     def make_tgt_mask(self, tgt_len: int, device: torch.device) -> torch.Tensor:
