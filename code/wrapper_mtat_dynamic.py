@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import csv
 import sys
+import yanml
 
 csv.field_size_limit(sys.maxsize)
 
@@ -301,8 +302,8 @@ TSV_FIELDS = [
     "max_len",
     "max_src_vocab",
     "max_tgt_vocab",
-    "metric_loss",
-    "metric_nll",
+    #"metric_loss",
+    #"metric_nll",
     "metric_val_nll",
     "metric_bleu",
     "metric_chrf",
@@ -711,18 +712,42 @@ def run_candidate(
     append_tsv_row(results_tsv, tsv_row)
     return completed_record
 
+def load_yaml_config(path: Optional[str]) -> Dict[str, Any]:
+    if not path:
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError("--config YAML must contain a mapping at the top level")
+    return data
+
+
+def yaml_items_to_cli_kv(mapping: Dict[str, Any]) -> List[str]:
+    out = []
+    for key, value in mapping.items():
+        out.append(f"{key}={value}")
+    return out
+
+
+def yaml_values_to_cli_values(mapping: Dict[str, Any]) -> List[str]:
+    out = []
+    for key, values in mapping.items():
+        if not isinstance(values, list):
+            values = [values]
+        out.append(f"{key}=" + ",".join(str(v) for v in values))
+    return out
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Dynamic beam-search hyperparameter wrapper for mtat.py")
     ap.add_argument("--mtat", default="mtat.py")
     ap.add_argument("--python", default="python")
-    ap.add_argument("--command", required=True, choices=["finetune", "translate"])
+    ap.add_argument("--command", choices=["finetune", "translate"])
 
     ap.add_argument("--set", action="append", default=[], help="Fixed mtat.py argument, key=value")
     ap.add_argument("--values", action="append", default=[], help="Search values, key=v1,v2,v3")
     ap.add_argument("--range", action="append", default=[], help="Search range, key=start:stop:step")
 
-    ap.add_argument("--save-template", required=True, help="Template for run directories")
+    ap.add_argument("--save-template", help="Template for run directories")
     ap.add_argument("--out-template", default=None)
     ap.add_argument("--study-dir", default=None, help="Directory for dynamic_beam_search.jsonl; default is parent of save-template")
 
@@ -752,7 +777,52 @@ def main() -> None:
     ap.add_argument("--force", action="store_true", help="rerun even if an expected model/checkpoint already exists")
 
     args = ap.parse_args()
+    config = load_yaml_config(args.config)
 
+    # Scalar wrapper options: YAML is used only if CLI did not set another value.
+    for key in [
+        "mtat",
+        "python",
+        "command",
+        "save_template",
+        "out_template",
+        "study_dir",
+        "generations",
+        "beam_width",
+        "expand_per_parent",
+        "initial_candidates",
+        "random_fraction",
+        "metric",
+        "direction",
+        "seed",
+    ]:
+        if key in config:
+            current = getattr(args, key)
+            parser_default = ap.get_default(key)
+            if current == parser_default or current is None:
+                setattr(args, key, config[key])
+
+    # Boolean flags from YAML
+    for key in ["execute", "force"]:
+        if key in config and not getattr(args, key):
+            setattr(args, key, bool(config[key]))
+
+    # Merge fixed settings and search values.
+    # CLI additions win when the same key occurs twice, because dict(parse_kv(...)) keeps the last one.
+    if "set" in config:
+        args.set = yaml_items_to_cli_kv(config["set"]) + args.set
+
+    if "values" in config:
+        args.values = yaml_values_to_cli_values(config["values"]) + args.values
+
+    if "range" in config:
+        args.range = yaml_items_to_cli_kv(config["range"]) + args.range
+
+    if args.command is None:
+        raise ValueError("Missing command: provide --command or command: in YAML")
+
+    if args.save_template is None:
+        raise ValueError("Missing save template: provide --save-template or save_template: in YAML")
     if args.top_k is not None:
         args.beam_width = args.top_k
     if args.random_starts is not None and args.initial_candidates is None:
