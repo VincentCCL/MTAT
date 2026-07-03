@@ -482,9 +482,12 @@ def apply_templates(params: Dict[str, Any], save_template: Optional[str], out_te
     if save_template:
         run_dir = Path(save_template.format(**params))
         params["run_dir"] = str(run_dir)
-        if params.get("model_type") == "rnn":
+        if params.get("model_type") in {"rnn","transformer-scratch"}:
             params["save"] = str(run_dir / "model.pt")
-            params["rnn_save_best"] = str(run_dir / "best.pt")
+            if params.get("model_type") == "rnn":
+                params["rnn_save_best"] = str(run_dir / "best.pt")
+            else:
+                params["scratch_save_best"] = str(run_dir / "best.pt")
         else:
             params["save"] = str(run_dir)
 
@@ -512,12 +515,13 @@ def build_command(py: str, mtat: str, command: str, params: Dict[str, Any]) -> L
 
 def model_exists(params: Dict[str, Any], run_base: Path) -> bool:
     model_type = params.get("model_type")
-    if model_type == "rnn":
+    if model_type in {"rnn", "transformer-scratch"}:
         candidates = []
         for key in ("save", "rnn_save_best"):
             if key in params:
                 candidates.append(Path(str(params[key])))
-        candidates.extend([run_base / "model.pt", run_base / "best.pt"])
+        candidates.extend([run_base / "model.pt", 
+                           run_base / "best.pt"])
         return any(p.is_file() and p.stat().st_size > 0 for p in candidates)
 
     model_files = [
