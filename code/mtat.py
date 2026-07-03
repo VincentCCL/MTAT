@@ -2891,7 +2891,7 @@ def finetune_scratch_transformer(args: argparse.Namespace) -> None:
         val_dataset = RNNParallelDataset(val_pairs_tok, 
                                          src_vocab, 
                                          tgt_vocab, 
-                                         max_len=args.max_lene)
+                                         max_len=args.max_len)
         val_loader = DataLoader(
             val_dataset,
             batch_size=args.eval_batch_size or args.batch_size,
