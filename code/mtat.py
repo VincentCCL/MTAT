@@ -2777,7 +2777,14 @@ def translate_scratch_transformer_lines(
     model.eval()
     batch_size = max(1, int(batch_size))
 
-    for batch in tqdm(list(batched(src_lines, batch_size)), desc="Translating", leave=False):
+    total_batches = (len(src_lines) + batch_size - 1) // batch_size
+
+    for batch in tqdm(
+        batched_iter(src_lines, batch_size),
+        total=total_batches,
+        desc="Translating",
+        leave=False,
+    ):                                          
         model_src_batch = [
             " ".join(src_sp.encode(src_sentence, out_type=str))
             if src_sp is not None and subword_type != "none"
