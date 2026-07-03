@@ -739,6 +739,8 @@ def yaml_values_to_cli_values(mapping: Dict[str, Any]) -> List[str]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Dynamic beam-search hyperparameter wrapper for mtat.py")
+    ap.add_argument("--config", type=str, default=None,
+            help="YAML configuration file")
     ap.add_argument("--mtat", default="mtat.py")
     ap.add_argument("--python", default="python")
     ap.add_argument("--command", choices=["finetune", "translate"])
