@@ -2237,8 +2237,17 @@ def finetune_rnn_seq2seq(args: argparse.Namespace) -> None:
         train_pairs_tok = apply_sentencepiece_to_pairs(train_pairs, src_sp, tgt_sp)
         all_src = [src for src, _ in train_pairs_tok]
         all_tgt = [tgt for _, tgt in train_pairs_tok]
-        src_vocab = build_vocab(all_src, max_size=args.max_src_vocab)
-        tgt_vocab = build_vocab(all_tgt, max_size=args.max_tgt_vocab)
+
+        src_vocab_limit = args.max_src_vocab
+        tgt_vocab_limit = args.max_tgt_vocab
+
+        # If SentencePiece is used, do not truncate the subword vocabulary again.
+        if subword_type != "none":
+            src_vocab_limit = None
+            tgt_vocab_limit = None
+
+        src_vocab = build_vocab(all_src, max_size=src_vocab_limit)
+        tgt_vocab = build_vocab(all_tgt, max_size=tgt_vocab_limit)    
         model_args = {
             "emb_size": args.emb_size,
             "hidden_size": args.hidden_size,
@@ -2928,8 +2937,23 @@ def finetune_scratch_transformer(args: argparse.Namespace) -> None:
         print(f"Loaded scratch Transformer checkpoint from {args.scratch_load}; resuming at epoch {start_epoch}.")
     else:
         train_pairs_tok = apply_sentencepiece_to_pairs(train_pairs, src_sp, tgt_sp)
-        src_vocab = build_vocab([src for src, _ in train_pairs_tok], max_size=args.max_src_vocab)
-        tgt_vocab = build_vocab([tgt for _, tgt in train_pairs_tok], max_size=args.max_tgt_vocab)
+
+        src_vocab_limit = args.max_src_vocab
+        tgt_vocab_limit = args.max_tgt_vocab
+
+        # If SentencePiece is used, do not truncate the subword vocabulary again.
+        if subword_type != "none":
+            src_vocab_limit = None
+            tgt_vocab_limit = None
+
+        src_vocab = build_vocab(
+            [src for src, _ in train_pairs_tok],
+            max_size=src_vocab_limit,
+        )
+        tgt_vocab = build_vocab(
+            [tgt for _, tgt in train_pairs_tok],
+            max_size=tgt_vocab_limit,
+        )
         model_args = {
             "model_type": "transformer-scratch",
             "d_model": args.hidden_size,
