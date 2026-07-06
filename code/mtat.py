@@ -2603,6 +2603,55 @@ class ScratchTransformerSeq2Seq(nn.Module):
         return generated[0, 1:].tolist()
 
     @torch.no_grad()
+    def beam_decode_one(
+        self,
+        src: torch.Tensor,
+        sos_idx: int,
+        eos_idx: int,
+        max_len: Optional[int] = None,
+        num_beams: int = 4,
+        length_penalty: float = 0.6,
+    ) -> List[int]:
+        self.eval()
+        max_len = max_len or self.max_len
+
+        beams = [([sos_idx], 0.0)]
+
+        for _ in range(max_len):
+            new_beams = []
+
+            for tokens, score in beams:
+                if tokens[-1] == eos_idx:
+                    new_beams.append((tokens, score))
+                    continue
+
+                generated = torch.tensor([tokens], dtype=torch.long, device=src.device)
+                logits = self.forward(src, generated)
+                log_probs = torch.log_softmax(logits[:, -1], dim=-1).squeeze(0)
+
+                top_scores, top_ids = torch.topk(log_probs, k=num_beams)
+
+                for tok_score, tok_id in zip(top_scores.tolist(), top_ids.tolist()):
+                    new_beams.append((tokens + [tok_id], score + tok_score))
+
+            def norm_score(item):
+                tokens, score = item
+                length = max(1, len(tokens) - 1)
+                return score / (length ** length_penalty)
+
+            beams = sorted(new_beams, key=norm_score, reverse=True)[:num_beams]
+
+            if all(tokens[-1] == eos_idx for tokens, _ in beams):
+                break
+
+        best_tokens = beams[0][0][1:]
+
+        if eos_idx in best_tokens:
+            best_tokens = best_tokens[:best_tokens.index(eos_idx)]
+
+        return best_tokens
+    
+    @torch.no_grad()
     def greedy_decode_batch(
         self,
         src: torch.Tensor,
@@ -2771,6 +2820,7 @@ def translate_scratch_transformer_lines(
     src_sp: Optional[object] = None,
     tgt_sp: Optional[object] = None,
     batch_size: int = 32,
+num_beams: int = 1,
 ) -> List[str]:
     """Translate source strings with the scratch Transformer in batches."""
     hyps: List[str] = []
@@ -2798,13 +2848,24 @@ def translate_scratch_transformer_lines(
             dtype=torch.long,
             device=device,
         )
-
-        batch_hyp_ids = model.greedy_decode_batch(
-            src_tensor,
-            tgt_vocab.sos_idx,
-            tgt_vocab.eos_idx,
-            max_len=max_len,
-        )
+        if num_beams > 1:
+            batch_hyp_ids = [
+                model.beam_decode_one(
+                    src_tensor[i:i + 1],
+                    tgt_vocab.sos_idx,
+                    tgt_vocab.eos_idx,
+                    max_len=max_len,
+                    num_beams=num_beams,
+                )
+                for i in range(src_tensor.size(0))
+            ]
+        else:
+            batch_hyp_ids = model.greedy_decode_batch(
+                src_tensor,
+                tgt_vocab.sos_idx,
+                tgt_vocab.eos_idx,
+                max_len=max_len,
+            )
 
         for hyp_ids in batch_hyp_ids:
             tokenised_hyp = tgt_vocab.decode(hyp_ids)
@@ -2839,6 +2900,10 @@ def translate_scratch_transformer_pairs(
         batch_size=batch_size,
     )
 
+def noam_lr_lambda(step: int, d_model: int, warmup_steps: int) -> float:
+    step = max(step, 1)
+    warmup_steps = max(warmup_steps, 1)
+    return (d_model ** -0.5) * min(step ** -0.5, step * (warmup_steps ** -1.5))
 
 def finetune_scratch_transformer(args: argparse.Namespace) -> None:
     """Train or resume a Transformer encoder-decoder from random initialisation."""
@@ -2879,7 +2944,21 @@ def finetune_scratch_transformer(args: argparse.Namespace) -> None:
             "max_position": args.max_position,
         }
         model = build_scratch_transformer_model(src_vocab, tgt_vocab, model_args, device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=args.lr,
+            betas=(0.9, 0.98),
+            eps=1e-9,
+        )
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: noam_lr_lambda(
+                step,
+                d_model=args.hidden_size,
+                warmup_steps=args.warmup_steps,
+            ),
+        )
         start_epoch = 1
         print(f"Source vocab size: {len(src_vocab.idx2word)}")
         print(f"Target vocab size: {len(tgt_vocab.idx2word)}")
@@ -2908,7 +2987,10 @@ def finetune_scratch_transformer(args: argparse.Namespace) -> None:
 
     print(f"Loaded {len(train_pairs)} training pairs; {len(train_dataset)} used after max_len={args.max_len} filtering.")
     print(f"Total trainable parameters: {count_trainable_parameters(model):,}")
-    criterion = nn.CrossEntropyLoss(ignore_index=tgt_vocab.pad_idx)
+    criterion = nn.CrossEntropyLoss(
+        ignore_index=tgt_vocab.pad_idx,
+        label_smoothing=args.label_smoothing,
+    )
     requested_metrics = parse_metrics(args.metrics) if args.eval_metrics else set()
     if requested_metrics and sacrebleu is None:
         raise RuntimeError("sacrebleu is required for scratch Transformer validation metrics: pip install sacrebleu")
@@ -2953,6 +3035,7 @@ def finetune_scratch_transformer(args: argparse.Namespace) -> None:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            scheduler.step()
             with torch.no_grad():
                 gold = tgt[:, 1:].contiguous()
                 n_tokens = (gold != tgt_vocab.pad_idx).sum().item()
@@ -2979,9 +3062,13 @@ def finetune_scratch_transformer(args: argparse.Namespace) -> None:
             if need_translations:
                 refs = [tgt for _, tgt in val_pairs]
                 hyps = translate_scratch_transformer_pairs(
-                    model, val_pairs, src_vocab, tgt_vocab, device, args.max_len, subword_type, src_sp, tgt_sp,
+                    model, val_pairs, src_vocab, tgt_vocab, device,
+                    args.max_len, subword_type, src_sp, tgt_sp,
                     batch_size=args.eval_batch_size or args.batch_size,
+                    num_beams=args.eval_num_beams,
                 )
+                
+            
             if requested_metrics and hyps is not None and refs is not None:
                 metrics = compute_rnn_sacrebleu_metrics(hyps, refs, requested_metrics)
                 record.update(metrics)
@@ -3386,7 +3473,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ft.add_argument("--seed", type=int, default=42)
     ft.add_argument("--heads", type=int, default=4, help="Transformer attention heads")
     ft.add_argument("--ff-size", type=int, default=1024, help="Transformer feed-forward size")
-
+    
     ft.add_argument("--batch-size", type=int, default=8)
     ft.add_argument("--eval-batch-size", type=int, default=None)
     ft.add_argument("--max-src-len", type=int, default=128)
@@ -3470,12 +3557,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     default=512,
                     help="Maximum position embedding size for scratch Transformer; must be >= max_len" \
                     "Note: this is not the same as max_len, which is the maximum sentence length for training and generation.")
-    #ft.add_argument("--d-model", type=int, default=256, help="Scratch Transformer embedding/hidden size")
-    #ft.add_argument("--nhead", type=int, default=4, help="Scratch Transformer attention heads")
-    #ft.add_argument("--transformer-enc-layers", type=int, default=3, help="Scratch Transformer encoder layers")
-    #ft.add_argument("--transformer-dec-layers", type=int, default=3, help="Scratch Transformer decoder layers")
     ft.add_argument("--dim-feedforward", type=int, default=1024, help="Scratch Transformer feed-forward size")
     ft.add_argument("--dropout", type=float, default=0.1, help="Scratch Transformer dropout")
+    ft.add_argument("--label-smoothing", type=float, default=0.1)
     ft.add_argument("--scratch-load", default=None, help="Scratch Transformer checkpoint to resume from")
     ft.add_argument("--scratch-save-best", default=None, help="Best scratch Transformer checkpoint path; default: <save>.best.pt")
     ft.add_argument("--scratch-keep-last", type=int, default=1, help="Number of scratch Transformer epoch checkpoints to keep")
