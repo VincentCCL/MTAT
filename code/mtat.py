@@ -2886,6 +2886,7 @@ def translate_scratch_transformer_pairs(
     src_sp: Optional[object],
     tgt_sp: Optional[object],
     batch_size: int = 32,
+    num_beams = 1,
 ) -> List[str]:
     return translate_scratch_transformer_lines(
         model,
@@ -2898,6 +2899,7 @@ def translate_scratch_transformer_pairs(
         src_sp=src_sp,
         tgt_sp=tgt_sp,
         batch_size=batch_size,
+        num_beams=num_beams,
     )
 
 def noam_lr_lambda(step: int, d_model: int, warmup_steps: int) -> float:
