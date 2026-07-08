@@ -69,7 +69,7 @@ def main():
         cmd = [
             "python", args.mtat, "translate",
             "--model-type", "transformer-scratch",
-            "--model", str(ckpt),
+            "--model-dir", str(ckpt),
             "--src-file", SRC_VAL,
             "--out-file", str(hyp_file),
             "--ref-file", TGT_VAL,
