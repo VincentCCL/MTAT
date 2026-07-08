@@ -790,6 +790,7 @@ def main() -> None:
         default=None,
         help="TSV file in which all trial results are stored."
     )
+    ap.add_argument("--resume-existing", action="store_true")
     args = ap.parse_args()
     config = load_yaml_config(args.config)
 

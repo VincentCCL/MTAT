@@ -3,6 +3,8 @@ import argparse
 import csv
 import subprocess
 from pathlib import Path
+import os
+import shlex
 
 
 SRC_VAL = "/home/nobackup/corpora/DeKamer/tmx/moses/250320.fr.dev"
@@ -24,10 +26,10 @@ def main():
     ap.add_argument("--tsv", required=True)
     ap.add_argument("--mtat", default="mtat.py")
     ap.add_argument("--top-n", type=int, default=5)
-    ap.add_argument("--metric", default="val_nll")
     ap.add_argument("--direction", choices=["min", "max"], default="min")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--execute", action="store_true")
+    ap.add_argument("--metric", default="metric_val_nll")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -64,7 +66,22 @@ def main():
         name = f"rank{rank:02d}_{args.metric}_{score:.4f}"
         hyp_file = out_dir / f"{name}.hyp.nl"
         log_file = out_dir / f"{name}.translate.log"
-        ckpt = Path(str(model_dir) + "/best.pt")
+        ckpt = model_dir / "best.pt"
+
+        if not ckpt.exists():
+            alt_dir = model_dir.parent / model_dir.name.replace(
+                "transformer_scratch_",
+                "transformer_scratch2_",
+                1,
+            )
+            alt_ckpt = alt_dir / "best.pt"
+
+            if alt_ckpt.exists():
+                print(f"Using renamed run dir: {alt_ckpt}")
+                ckpt = alt_ckpt
+            else:
+                print(f"SKIP: neither {ckpt} nor {alt_ckpt} exists")
+                continue
 
         cmd = [
             "python", args.mtat, "translate",
@@ -83,14 +100,23 @@ def main():
         print(" ".join(cmd))
 
         if args.execute:
-            with open(log_file, "w", encoding="utf-8") as log:
-                subprocess.run(
-                    cmd,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    check=False,
-                )
+            cmd_str = " ".join(shlex.quote(x) for x in cmd)
+
+            tee_cmd = (
+                f"set -o pipefail; "
+                f"{cmd_str} 2>&1 | tee {shlex.quote(str(log_file))}"
+            )
+
+            proc = subprocess.run(
+                ["bash", "-c", tee_cmd],
+                env=os.environ.copy(),
+            )
+
+            if proc.returncode != 0:
+                print(f"FAILED: {name}")
+            else:
+                print(f"OK: {name}")
+            
 
 
 if __name__ == "__main__":
