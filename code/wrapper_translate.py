@@ -74,10 +74,7 @@ def main():
             "--ref-file", TGT_VAL,
             "--src-lang", "fr",
             "--tgt-lang", "nl",
-            "--src-sp-model", SRC_SP,
-            "--tgt-sp-model", TGT_SP,
-            "--eval-metrics",
-            "--eval-num-beams", "4",
+            "--metrics", "bleu,chrf,ter",
         ]
 
         print("\n===", name, "===")
