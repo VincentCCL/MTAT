@@ -64,7 +64,7 @@ def main():
         name = f"rank{rank:02d}_{args.metric}_{score:.4f}"
         hyp_file = out_dir / f"{name}.hyp.nl"
         log_file = out_dir / f"{name}.translate.log"
-        ckpt = Path(str(model_dir) + ".best.pt")
+        ckpt = Path(str(model_dir) + "/best.pt")
 
         cmd = [
             "python", args.mtat, "translate",
