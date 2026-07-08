@@ -56,6 +56,9 @@ def main():
     reverse = args.direction == "max"
     usable.sort(key=lambda x: x[0], reverse=reverse)
     selected = usable[: args.top_n]
+    print(f"Read {len(rows)} rows from TSV")
+    print(f"Found {len(usable)} usable rows with metric {args.metric}")
+    print(f"Selected {len(selected)} models")
 
     for rank, (score, row, model_dir) in enumerate(selected, start=1):
         name = f"rank{rank:02d}_{args.metric}_{score:.4f}"
