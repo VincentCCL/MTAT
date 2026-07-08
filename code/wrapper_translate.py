@@ -64,17 +64,19 @@ def main():
         name = f"rank{rank:02d}_{args.metric}_{score:.4f}"
         hyp_file = out_dir / f"{name}.hyp.nl"
         log_file = out_dir / f"{name}.translate.log"
+        ckpt = Path(str(model_dir) + ".best.pt")
 
         cmd = [
             "python", args.mtat, "translate",
             "--model-type", "transformer-scratch",
-            "--model", str(model_dir),
+            "--model", str(ckpt),
             "--src-file", SRC_VAL,
             "--out-file", str(hyp_file),
             "--ref-file", TGT_VAL,
             "--src-lang", "fr",
             "--tgt-lang", "nl",
             "--metrics", "bleu,chrf,ter",
+            "--batch-size", "32",
         ]
 
         print("\n===", name, "===")
