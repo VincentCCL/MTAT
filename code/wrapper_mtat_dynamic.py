@@ -79,7 +79,7 @@ HIGHER_IS_BETTER = {
 }
 
 # These are generated/used by the wrapper and should not be passed to mtat.py.
-WRAPPER_ONLY_KEYS = {"log_file", "run_dir"}
+WRAPPER_ONLY_KEYS = {"log_file", "run_dir", "resume_parent"}
 
 
 def normalize_key(key: str) -> str:
@@ -296,18 +296,22 @@ TSV_FIELDS = [
     "dec_layers",
     "hidden_size",
     "bidirectional",
-    "attention",
+    #"attention",
+    "ff_size",
+    "heads",
+    "dropout",
+    "max_position",
     "batch_size",
     "subword_type",
     "max_len",
-    "max_src_vocab",
-    "max_tgt_vocab",
+    #"max_src_vocab",
+    #"max_tgt_vocab",
     #"metric_loss",
     #"metric_nll",
     "metric_val_nll",
-    "metric_bleu",
-    "metric_chrf",
-    "metric_ter",
+    #"metric_bleu",
+    #"metric_chrf",
+    #"metric_ter",
 ]
 
 def append_tsv_row(path: Path, row: Dict[str, Any]) -> None:
@@ -437,13 +441,34 @@ def expand_beam(
     rng: random.Random,
     tried: Set[Tuple[Tuple[str, str], ...]],
     random_fraction: float = 0.0,
+    continue_parents: bool = True,
     max_attempts: int = 10000,
 ) -> List[Dict[str, Any]]:
+    """Expand the current beam into next-generation candidates.
+
+    For every selected parent, optionally add one explicit continuation child:
+    same hyperparameters, loaded from the parent's latest checkpoint, but written
+    to a new run directory.  The remaining slots are ordinary one-step mutations.
+    """
     out: List[Dict[str, Any]] = []
     search_keys = list(space.keys())
     target = max(1, len(beam)) * max(1, expand_per_parent)
-    attempts = 0
 
+    if continue_parents and beam:
+        for parent_record in beam:
+            if len(out) >= target:
+                break
+            parent_params = dict(fixed)
+            parent_params.update({key: str(parent_record["params"][key]) for key in search_keys if key in parent_record["params"]})
+            out.append({
+                "params": parent_params,
+                "parent": parent_record,
+                "mutated_param": "continue_parent",
+                "child_distance": 0,
+                "resume_parent": True,
+            })
+
+    attempts = 0
     while len(out) < target and attempts < max_attempts:
         attempts += 1
 
@@ -455,9 +480,8 @@ def expand_beam(
             mutated_keys = ["random"]
             child_distance = ""
         else:
-            # Expand beam parents in score order. The first expand_per_parent
-            # children are therefore generated from the current best parent.
-            parent_index = min(len(beam) - 1, len(out) // max(1, expand_per_parent))
+            mutation_slots_done = max(0, len(out) - (len(beam) if continue_parents else 0))
+            parent_index = min(len(beam) - 1, mutation_slots_done // max(1, expand_per_parent))
             parent_record = beam[parent_index]
             parent = parent_record["params"]
             dynamic, mutated_keys = mutate_one_or_more(parent, space, rng, max_changes=1)
@@ -474,9 +498,9 @@ def expand_beam(
             "parent": parent_record,
             "mutated_param": ",".join(mutated_keys),
             "child_distance": child_distance,
+            "resume_parent": False,
         })
     return out
-
 
 def apply_templates(params: Dict[str, Any], save_template: Optional[str], out_template: Optional[str]) -> None:
     if save_template:
@@ -555,6 +579,43 @@ def classify_failure(returncode: int, stdout_file: Path) -> str:
     return reason
 
 
+
+def configure_parent_continuation(
+    params: Dict[str, Any],
+    parent_record: Dict[str, Any],
+    generation: int,
+    stage_epochs: Optional[int],
+) -> None:
+    """Turn a same-hyperparameter child into a resumed continuation run."""
+    model_type = str(params.get("model_type", ""))
+    if model_type not in {"rnn", "transformer-scratch"}:
+        return
+
+    parent_run = Path(str(parent_record.get("run_base")))
+    parent_model = parent_run / "model.pt"
+    parent_checkpoint = find_latest_epoch_checkpoint(str(parent_model))
+    if parent_checkpoint is None:
+        parent_checkpoint = str(parent_run / "best.pt") if (parent_run / "best.pt").is_file() else None
+    if parent_checkpoint is None:
+        raise FileNotFoundError(f"Cannot continue parent; no checkpoint found in {parent_run}")
+
+    suffix = f"continued_g{generation}"
+    if stage_epochs is not None:
+        suffix += f"_e{stage_epochs}"
+    run_dir = parent_run.parent / f"{parent_run.name}_{suffix}"
+
+    params["run_dir"] = str(run_dir)
+    params["save"] = str(run_dir / "model.pt")
+    params["history_json"] = str(run_dir / "history.json")
+    params["log_file"] = str(run_dir / "stdout.log")
+
+    if model_type == "rnn":
+        params["rnn_load"] = parent_checkpoint
+        params["rnn_save_best"] = str(run_dir / "best.pt")
+    else:
+        params["scratch_load"] = parent_checkpoint
+        params["scratch_save_best"] = str(run_dir / "best.pt")
+
 def run_candidate(
     params_in: Dict[str, Any],
     args: argparse.Namespace,
@@ -566,12 +627,27 @@ def run_candidate(
     parent_record: Optional[Dict[str, Any]] = None,
     mutated_param: str = "",
     child_distance: Any = "",
+    stage_epochs: Optional[int] = None,
+    resume_parent: bool = False,
 ) -> Optional[Dict[str, Any]]:
     params = dict(params_in)
+    if stage_epochs is not None:
+        params["epochs"] = str(stage_epochs)
     apply_templates(params, args.save_template, args.out_template)
+    if resume_parent:
+        if parent_record is None:
+            raise ValueError("resume_parent=True requires a parent_record")
+        configure_parent_continuation(params, parent_record, generation, stage_epochs)
 
     run_base = Path(str(params.get("run_dir", params.get("save"))))
     run_base.mkdir(parents=True, exist_ok=True)
+    should_resume = (
+        args.resume_existing
+        and model_exists(params, run_base)
+        and not args.force
+    )
+    if should_resume:
+        params["auto_resume"] = True
     wrapper_log = run_base / "wrapper.log"
     stdout_file = Path(str(params.get("log_file", run_base / "stdout.log")))
     history_file = Path(str(params.get("history_json", run_base / "history.json")))
@@ -604,11 +680,11 @@ def run_candidate(
         "parent_run_dir": None if parent_record is None else parent_record.get("run_base"),
         "mutated_param": mutated_param,
         "child_distance": child_distance,
+        "resume_parent": resume_parent,
     }
 
     completed_record: Optional[Dict[str, Any]] = None
-
-    if not args.force and model_exists(params, run_base):
+    if not args.force and model_exists(params, run_base) and not args.resume_existing:
         score = read_best_score(history_file, args.metric, direction)
         event.update({"status": "skipped_existing", "score": score})
         print(f"SKIP: model/checkpoint exists: {run_base}")
@@ -772,6 +848,16 @@ def main() -> None:
         default=0.0,
         help="Fraction of candidates sampled fully randomly after generation 1; default 0 for pure beam expansion",
     )
+    ap.add_argument(
+        "--epoch-schedule",
+        default=None,
+        help="Comma-separated staged epoch budgets, e.g. 3,8,15,30. Overrides --generations length if used."
+    )
+    ap.add_argument(
+        "--no-continue-parents",
+        action="store_true",
+        help="Do not add same-hyperparameter resumed parent runs in generations after the first.",
+    )
 
     # Backwards-compatible dynamic-wrapper aliases. They are accepted, but beam args are preferred.
     ap.add_argument("--trials", type=int, default=None, help=argparse.SUPPRESS)
@@ -792,6 +878,7 @@ def main() -> None:
     )
     ap.add_argument("--resume-existing", action="store_true")
     args = ap.parse_args()
+    
     config = load_yaml_config(args.config)
 
     # Scalar wrapper options: YAML is used only if CLI did not set another value.
@@ -811,6 +898,9 @@ def main() -> None:
         "metric",
         "direction",
         "seed",
+        "epoch_schedule",
+        "resume_existing",
+        "no_continue_parents", 
     ]:
         if key in config:
             current = getattr(args, key)
@@ -819,7 +909,7 @@ def main() -> None:
                 setattr(args, key, config[key])
 
     # Boolean flags from YAML
-    for key in ["execute", "force"]:
+    for key in ["execute", "force", "no_continue_parents"]:
         if key in config and not getattr(args, key):
             setattr(args, key, bool(config[key]))
 
@@ -843,7 +933,22 @@ def main() -> None:
         args.beam_width = args.top_k
     if args.random_starts is not None and args.initial_candidates is None:
         args.initial_candidates = args.random_starts
+        epoch_schedule = None
+    epoch_schedule = []
 
+    if isinstance(args.epoch_schedule, list):
+        epoch_schedule = [int(x) for x in args.epoch_schedule]
+
+    elif isinstance(args.epoch_schedule, str):
+        epoch_schedule = [
+            int(x.strip())
+            for x in args.epoch_schedule.split(",")
+            if x.strip()
+        ]
+
+    if epoch_schedule:
+        args.generations = len(epoch_schedule)
+    
     rng = random.Random(args.seed)
     direction = metric_direction(args.metric, "auto" if args.direction == "auto" else args.direction)
 
@@ -894,6 +999,7 @@ def main() -> None:
                 rng=rng,
                 tried=tried,
                 random_fraction=args.random_fraction,
+                continue_parents=not args.no_continue_parents,
             )
 
         if not candidates:
@@ -904,6 +1010,7 @@ def main() -> None:
 
         for trial_in_generation, candidate_info in enumerate(candidates, start=1):
             global_trial += 1
+            stage_epochs = epoch_schedule[generation - 1] if epoch_schedule else None
             record = run_candidate(
                 params_in=candidate_info["params"],
                 args=args,
@@ -915,6 +1022,8 @@ def main() -> None:
                 parent_record=candidate_info.get("parent"),
                 mutated_param=str(candidate_info.get("mutated_param", "")),
                 child_distance=candidate_info.get("child_distance", ""),
+                stage_epochs=stage_epochs,
+                resume_parent=bool(candidate_info.get("resume_parent", False)),
             )
             if record is not None:
                 completed.append(record)

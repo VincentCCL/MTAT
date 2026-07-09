@@ -667,7 +667,6 @@ def finetune_hf_seq2seq(args: argparse.Namespace) -> None:
         raise ValueError(f"Validation src/tgt line counts differ: {len(val_src)} vs {len(val_tgt)}")
 
     os.makedirs(args.save, exist_ok=True)
-
     # Avoid accidental overwrites. To continue a previous run with optimiser and
     # scheduler state, use --resume-from-checkpoint or --auto-resume.
     if (
@@ -2228,11 +2227,26 @@ def finetune_rnn_seq2seq(args: argparse.Namespace) -> None:
         raise ValueError("No training sentence pairs were loaded.")
     val_pairs = read_parallel(args.src_val, args.tgt_val, lower=args.lower) if args.src_val and args.tgt_val else None
 
-    if args.rnn_load:
-        model, optimizer, src_vocab, tgt_vocab, model_args, stored_epoch = load_rnn_checkpoint(args.rnn_load, device)
+    rnn_resume_path = args.rnn_load
+
+    if rnn_resume_path is None and args.auto_resume:
+        rnn_resume_path = find_latest_epoch_checkpoint(args.save)
+        if rnn_resume_path:
+            print(f"Auto-resuming RNN from latest checkpoint: {rnn_resume_path}")
+        else:
+            print("--auto-resume was set, but no RNN epoch checkpoint was found. Starting a new run.")
+
+    if rnn_resume_path:
+        model, optimizer, src_vocab, tgt_vocab, model_args, stored_epoch = load_rnn_checkpoint(rnn_resume_path, device)
         subword_type, src_sp, tgt_sp = load_sentencepiece_processors(model_args)
         start_epoch = stored_epoch + 1
-        print(f"Loaded RNN checkpoint from {args.rnn_load}; resuming at epoch {start_epoch}.")
+        print(f"Loaded RNN checkpoint from {rnn_resume_path}; resuming at epoch {start_epoch}.")
+        if start_epoch > args.epochs:
+            print(
+                f"Checkpoint is already at epoch {start_epoch - 1}; "
+                f"requested --epochs {args.epochs}. Nothing to do."
+            )
+            return
     else:
         train_pairs_tok = apply_sentencepiece_to_pairs(train_pairs, src_sp, tgt_sp)
         all_src = [src for src, _ in train_pairs_tok]
@@ -2930,14 +2944,44 @@ def finetune_scratch_transformer(args: argparse.Namespace) -> None:
         raise ValueError("No training sentence pairs were loaded.")
     val_pairs = read_parallel(args.src_val, args.tgt_val, lower=args.lower) if args.src_val and args.tgt_val else None
 
-    if args.scratch_load:
-        model, optimizer, src_vocab, tgt_vocab, model_args, stored_epoch = load_scratch_transformer_checkpoint(args.scratch_load, device)
+    scratch_resume_path = args.scratch_load
+
+    if scratch_resume_path is None and args.auto_resume:
+        scratch_resume_path = find_latest_epoch_checkpoint(args.save)
+        if scratch_resume_path:
+            print(f"Auto-resuming scratch Transformer from latest checkpoint: {scratch_resume_path}")
+        else:
+            print("--auto-resume was set, but no scratch Transformer epoch checkpoint was found. Starting a new run.")
+
+    if scratch_resume_path:
+        model, optimizer, src_vocab, tgt_vocab, model_args, stored_epoch = load_scratch_transformer_checkpoint(
+            scratch_resume_path,
+            device,
+        )
+
         subword_type, src_sp, tgt_sp = load_sentencepiece_processors(model_args)
         start_epoch = stored_epoch + 1
-        print(f"Loaded scratch Transformer checkpoint from {args.scratch_load}; resuming at epoch {start_epoch}.")
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: noam_lr_lambda(
+                step,
+                d_model=int(model_args.get("d_model", args.hidden_size)),
+                warmup_steps=args.warmup_steps,
+            ),
+        )
+
+        print(f"Loaded scratch Transformer checkpoint from {scratch_resume_path}; resuming at epoch {start_epoch}.")
+
+        if start_epoch > args.epochs:
+            print(
+                f"Checkpoint is already at epoch {start_epoch - 1}; "
+                f"requested --epochs {args.epochs}. Nothing to do."
+            )
+            return
+
     else:
         train_pairs_tok = apply_sentencepiece_to_pairs(train_pairs, src_sp, tgt_sp)
-
         src_vocab_limit = args.max_src_vocab
         tgt_vocab_limit = args.max_tgt_vocab
 
@@ -3215,6 +3259,29 @@ def find_latest_checkpoint(run_dir: str) -> Optional[str]:
 
     return max(checkpoints, key=checkpoint_step)
 
+def checkpoint_epoch(path: str) -> int:
+    base = os.path.basename(path)
+    match = re.search(r"\.epoch(\d+)\.pt$", base)
+    if not match:
+        return -1
+    return int(match.group(1))
+
+
+def find_latest_epoch_checkpoint(save_path: str) -> Optional[str]:
+    if save_path.endswith(".pt"):
+        prefix = save_path[:-3]
+    else:
+        prefix = save_path
+
+    candidates = [
+        path for path in glob.glob(f"{prefix}.epoch*.pt")
+        if checkpoint_epoch(path) >= 0
+    ]
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=checkpoint_epoch)
 
 def resolve_resume_checkpoint(args: argparse.Namespace) -> Optional[str]:
     """
