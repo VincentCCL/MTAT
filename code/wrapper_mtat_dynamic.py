@@ -36,11 +36,13 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import glob
 import itertools
 import json
 import math
 import os
 import random
+import re
 import shlex
 import subprocess
 from datetime import datetime
@@ -537,11 +539,37 @@ def build_command(py: str, mtat: str, command: str, params: Dict[str, Any]) -> L
     return cmd
 
 
+
+def checkpoint_epoch(path: str) -> int:
+    base = os.path.basename(path)
+    match = re.search(r"\.epoch(\d+)\.pt$", base)
+    if not match:
+        return -1
+    return int(match.group(1))
+
+
+def find_latest_epoch_checkpoint(save_path: str) -> Optional[str]:
+    """Return latest model.epochNNN.pt checkpoint for a model.pt-style path."""
+    if save_path.endswith(".pt"):
+        prefix = save_path[:-3]
+    else:
+        prefix = save_path
+
+    candidates = [
+        path for path in glob.glob(f"{prefix}.epoch*.pt")
+        if checkpoint_epoch(path) >= 0
+    ]
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=checkpoint_epoch)
+
 def model_exists(params: Dict[str, Any], run_base: Path) -> bool:
     model_type = params.get("model_type")
     if model_type in {"rnn", "transformer-scratch"}:
         candidates = []
-        for key in ("save", "rnn_save_best"):
+        for key in ("save", "rnn_save_best", "scratch_save_best"):
             if key in params:
                 candidates.append(Path(str(params[key])))
         candidates.extend([run_base / "model.pt", 
